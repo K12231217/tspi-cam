@@ -174,7 +174,7 @@ Issues and improvements are welcome. Include hardware, configuration, reproducti
 
 The project architecture — daemon owning hardware, local IPC for clients, and a separate calibration tool with exclusive hardware access — follows [EasyDuck](https://github.com/jlckfb/easyduck) (Apache-2.0), the Taishan Pi biped robot project by the LCKFB team. Thanks to that project and its contributors.
 
-The root project license is MIT OR Apache-2.0, at your option. Third-party content retains its own terms. See `LICENSE-MIT` and `LICENSE-APACHE` (to be added before the first public push).
+The root project license is MIT OR Apache-2.0, at your option. Third-party content retains its own terms. See `LICENSE-MIT` and `LICENSE-APACHE`.
 
 ## References
 
