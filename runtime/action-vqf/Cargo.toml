@@ -1,0 +1,33 @@
+[package]
+name = "action-vqf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Vendored vqf-rs 0.3.0: VQF IMU orientation estimation (6D use in tspi-cam)"
+repository = "https://github.com/K12231217/tspi-cam"
+
+[lib]
+name = "vqf_rs"
+path = "src/lib.rs"
+
+[features]
+default = ["std", "motion-bias-estimation"]
+f32 = []
+libm = ["dep:libm"]
+micromath = ["dep:micromath", "f32"]
+motion-bias-estimation = []
+std = []
+
+[dependencies.libm]
+version = "0.2.8"
+optional = true
+
+[dependencies.micromath]
+version = "2.1.0"
+optional = true
+
+# Vendored upstream code: exempt from our clippy strictness so the file
+# stays verbatim (upstream's own doc style trips doc-lazy-continuation).
+# Our own code lives in action-core and is still linted.
+[lints.clippy]
+all = "allow"

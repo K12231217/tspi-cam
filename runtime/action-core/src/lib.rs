@@ -6,5 +6,6 @@
 pub mod capture;
 pub mod clock;
 pub mod imu;
+pub mod orientation;
 pub mod record;
 pub mod types;
