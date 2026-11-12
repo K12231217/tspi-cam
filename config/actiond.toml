@@ -1,0 +1,33 @@
+# actiond runtime configuration template.
+# Install to /etc/tspi-cam/actiond.toml. The installer never overwrites
+# an existing file. See docs/architecture.md §12 for the meaning of each key.
+
+[camera]
+device = "/dev/video0"   # MIPI node, TODO: Hardware Verification (H8)
+width = 1920
+height = 1080
+fps = 30
+
+[imu]
+device = "/dev/spidev3.0"
+rate_hz = 200
+# Stop recording when either limit is hit (see architecture §5.2):
+# continuous dropped samples, or dropped samples in any 10 s window.
+max_consecutive_dropped = 50
+max_dropped_per_10s = 100
+
+[record]
+dir = "/userdata/rec"
+storage_headroom_mb = 500
+video_queue_max_frames = 8
+video_queue_max_bytes_mb = 64
+
+[preview]
+max_fps = 10
+
+[ipc]
+control_socket = "/run/tspi-cam/control.sock"
+preview_socket = "/run/tspi-cam/preview.sock"
+
+[log]
+level = "info"

@@ -1,0 +1,17 @@
+[Unit]
+Description=tspi-cam recording daemon
+After=network.target local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/actiond /etc/tspi-cam/actiond.toml
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=tspi-cam
+RuntimeDirectoryMode=0755
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

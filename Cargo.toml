@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "runtime/actiond",
+    "runtime/actionctl",
+    "runtime/ui",
+    "runtime/action-core",
+    "runtime/action-ipc",
+    "runtime/action-config",
+    "calibration/actioncal",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Qiyuan Li"]
+repository = "https://github.com/K12231217/tspi-cam"
+
+[workspace.dependencies]
+action-core = { path = "runtime/action-core" }
+action-ipc = { path = "runtime/action-ipc" }
+action-config = { path = "runtime/action-config" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 2
+debug = false

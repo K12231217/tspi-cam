@@ -1,0 +1,16 @@
+[package]
+name = "actiond"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "actiond"
+path = "src/main.rs"
+
+[dependencies]
+action-core.workspace = true
+action-ipc.workspace = true
+action-config.workspace = true
+env_logger.workspace = true
+log.workspace = true
