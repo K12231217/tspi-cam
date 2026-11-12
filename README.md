@@ -1,7 +1,7 @@
-# tspi-action-rs
+# tspi-cam
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
-[![Status: work in progress](https://img.shields.io/badge/status-work%20in%20progress-orange.svg)](https://github.com/K12231217/tspi-action-rs)
+[![Status: work in progress](https://img.shields.io/badge/status-work%20in%20progress-orange.svg)](https://github.com/K12231217/tspi-cam)
 
 **A Rust reimplementation of the TspiAction handheld action camera concept, running on the LCKFB Taishan Pi (RK3566). It records video and IMU data in sync on the board; stabilisation is done offline on a PC.**
 
@@ -73,7 +73,7 @@ A Linux PC or WSL2 works too: install `gcc-aarch64-linux-gnu` and run `cargo bui
 
 ## Architecture
 
-`tspi-action-rs` centers on `actiond`: the touch UI and CLI send record requests, the daemon owns the camera, IMU, and storage, and the recorder writes synchronised video + IMU data. Calibration and service management support this record chain.
+`tspi-cam` centers on `actiond`: the touch UI and CLI send record requests, the daemon owns the camera, IMU, and storage, and the recorder writes synchronised video + IMU data. Calibration and service management support this record chain.
 
 ### Components and responsibilities
 
