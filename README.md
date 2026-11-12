@@ -22,11 +22,10 @@
 |---|---|
 | Synchronised recording | Video frames and IMU samples share one monotonic clock, written together for offline stabilisation |
 | SPI IMU sampling | IMU660RB at ~200 Hz; gyroscope + accelerometer, raw values only |
-| USB camera capture | MJPEG straight from the camera — no encoder needed for the demo |
+| MIPI camera capture | OV5695 NV12, encoded to MJPEG via GStreamer `jpegenc` for the demo |
 | Touch UI | Live preview, start/stop recording, recording status |
 | Calibration tool | Camera intrinsics + camera–IMU extrinsics and time offset, stored per device |
 | Storage protection | Recording stops before the disk fills; the system stays alive |
-| MIPI camera support | OV5695 via the board's CSI seat (hardware ordered) |
 
 ## Getting started
 
@@ -36,7 +35,6 @@
 |---|---|
 | Controller | Taishan Pi 1M, RK3566, ARM64 Linux with systemd |
 | MIPI camera | OV5695, 30-pin 0.5 mm MIPI CSI, 5 MP |
-| USB camera | Generic UVC camera (MJPEG) on `/dev/video*` |
 | IMU | IMU660RB 6-axis module on SPI3 (`/dev/spidev3.0`) |
 | Touchscreen | Waveshare 3.5″ HDMI capacitive touch LCD, 480×800 IPS, USB-C touch |
 | Storage | Recordings go to `/userdata/rec`, never to the 6 GB root partition |
@@ -47,7 +45,7 @@ OV5695 is 5 MP, not the original's 8 MP. 8 MP MIPI options for this board are un
 
 ### First recording
 
-1. Assemble the hardware: camera on the CSI seat (or USB camera plugged in), IMU660RB wired to SPI3, touchscreen on Micro HDMI + USB.
+1. Assemble the hardware: camera on the CSI seat, IMU660RB wired to SPI3, touchscreen on Micro HDMI + USB.
 2. Install the applications on the board (see Build the applications).
 3. Run the calibration tool once and save the device calibration. Recording without it still works, but offline stabilisation will be poor.
 4. Open the touch UI, check the preview, and press record. A short clip and its IMU log appear in `/userdata/rec`.
@@ -107,11 +105,11 @@ flowchart TB
 
 When the operator presses record, the touch UI sends a start request to `actiond` through the local Unix socket. The daemon checks record state and storage headroom before accepting it; the UI never touches hardware directly.
 
-The record loop targets **30 fps video and ~200 Hz IMU sampling**. Each frame and each sample is stamped with the same monotonic clock (`CLOCK_MONOTONIC`) and written together, so the gyro trace lines up with the video during offline stabilisation. Linux scheduling and USB/SPI timing affect actual rates; these are targets, not hard real-time guarantees.
+The record loop targets **30 fps video and ~200 Hz IMU sampling**. Each frame and each sample is stamped with the same monotonic clock (`CLOCK_MONOTONIC`) and written together, so the gyro trace lines up with the video during offline stabilisation. Linux scheduling and MIPI/SPI timing affect actual rates; these are targets, not hard real-time guarantees.
 
 | Record data | Rate (target) | Purpose |
 |---|---|---|
-| Video frames (MJPEG) | 30 fps | The picture |
+| Video frames (MJPEG, transcoded from NV12 via `jpegenc`) | 30 fps | The picture |
 | Gyroscope (3-axis) | ~200 Hz | Rotation for stabilisation |
 | Accelerometer (3-axis) | ~200 Hz | Gravity direction + motion context |
 | Monotonic timestamps | per frame/sample | Align gyro trace to video |
@@ -126,7 +124,7 @@ During normal operation, `actiond` exclusively owns the camera device, `/dev/spi
 
 ### Calibration and configuration handoff
 
-Calibration needs direct camera and IMU access, so it runs separately from normal recording. Systemd unit conflicts prevent the calibration tool and `actiond` from running concurrently.
+Calibration needs direct camera and IMU access, so it runs separately from normal recording. `actiond` and the calibration tool share one `flock()` on `/run/tspi-cam/device.lock`; whichever holds it owns the hardware, and the lock is released by the kernel if a process crashes.
 
 The usual sequence is: **stop recording → let calibration take ownership → save device calibration → leave calibration → reopen recording with the saved calibration**. Saving does not live-reconfigure an already running daemon; leaving calibration restarts the recording service so it reopens hardware and reads the saved data.
 
@@ -150,6 +148,7 @@ The IPC socket is local-only. If a web UI is added later, do not expose its port
 
 | Goal | Read |
 |---|---|
+| Understand the architecture (what goes where) | `docs/architecture.md` |
 | Install, configure, and operate | `docs/software-guide.md` (planned) |
 | Build, install, or roll back applications | `docs/deployment.md` (planned) |
 | Calibrate camera and IMU | `docs/calibration.md` (planned) |
