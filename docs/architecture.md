@@ -702,12 +702,12 @@ M1 分 A/B 两段。OV5695 模块未到货，M1 不整体阻塞：A 段不依赖
 
 | # | 事项 | 方法 | 影响 |
 |---|---|---|---|
-| H1 | SoC 确认为 RK3566（提示词写 RK3568 有误） | `cat /proc/device-tree/compatible` / `cat /proc/cpuinfo` | 文档与构建目标 |
+| H1 | SoC 确认为 RK3566（提示词写 RK3568 有误） | `cat /proc/device-tree/compatible` / `cat /proc/cpuinfo` | 文档与构建目标 | ✅ 已验证 2026-11-13：`lckfb,tspi-v10` + `rockchip,rk3566` |
 | H2 | V4L2 驱动时间戳的时钟域**与语义** | 测试程序：读 `v4l2_buffer.timestamp`，与 `CLOCK_MONOTONIC` 及 `t_read` 对比，判定 SOF / EOF / Dequeue | §6.2 的时间戳方案 |
-| H3 | IMU660RB 的 WHO_AM_I | 读寄存器 `0x0F`，期望 `0x6B`（LSM6DSR 家族） | 芯片身份确认 |
+| H3 | IMU660RB 的 WHO_AM_I | 读寄存器 `0x0F`，期望 `0x6B`（LSM6DSR 家族） | 芯片身份确认 | ✅ 已验证 2026-11-13：`imu_logger.py` 的 ID 检查通过才采样，60 s 采到 12000 采样（200.0 Hz，抖动 std 0.10 ms），即 WHO_AM_I = 0x6B |
 | H4 | INT1/INT2 接到 40-pin 的哪两个 GPIO | 用户确认接线 | DRDY 支持（M2）的前提 |
-| H5 | `/dev/spidev3.0` 重启后是否还在 | 重启后 `ls /dev/spidev*` | spidev 绑定持久化方案 |
-| H6 | SPI 最高可用速率与误码 | 1 MHz / 5 MHz 下连续读取测试 | `imu.rate_hz` 上限 |
+| H5 | `/dev/spidev3.0` 重启后是否还在 | 重启后 `ls /dev/spidev*` | spidev 绑定持久化方案 | （部分证据 2026-11-13：`/dev/spidev3.0` 存在；是否经重启保留仍未测） |
+| H6 | SPI 最高可用速率与误码 | 1 MHz / 5 MHz 下连续读取测试 | `imu.rate_hz` 上限 | （部分证据 2026-11-13：1 MHz 下 200 Hz 轮询 60 s 零丢样；5 MHz 未测） |
 | H7 | eMMC 持续写速度（MJPEG 1080p30 码率下） | 板上写盘测试 | 队列容量与存储保护阈值 |
 | H8 | OV5695 到货后：MIPI 节点、驱动、NV12 输出 | `v4l2-ctl` + 试采 | **M1 B 段的门** |
 | H9 | 实际帧大小与队列内存占用（NV12 1080p） | 板上录制实测，核对 64 MiB 上限 | §5.1 队列字节上限（现为工程直觉，未验证） |
