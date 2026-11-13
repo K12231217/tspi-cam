@@ -705,9 +705,9 @@ M1 分 A/B 两段。OV5695 模块未到货，M1 不整体阻塞：A 段不依赖
 | H1 | SoC 确认为 RK3566（提示词写 RK3568 有误） | `cat /proc/device-tree/compatible` / `cat /proc/cpuinfo` | 文档与构建目标 | ✅ 已验证 2026-11-13：`lckfb,tspi-v10` + `rockchip,rk3566` |
 | H2 | V4L2 驱动时间戳的时钟域**与语义** | 测试程序：读 `v4l2_buffer.timestamp`，与 `CLOCK_MONOTONIC` 及 `t_read` 对比，判定 SOF / EOF / Dequeue | §6.2 的时间戳方案 | ✅ 已验证（USB/UVC）2026-11-13：`v4l2-ctl --verbose` 显示 `ts-monotonic, ts-src-soe`，即 CLOCK_MONOTONIC + 曝光开始时刻 = 架构定义的 `t_capture`，直接用，无需偏差补偿或降级；帧间隔 99.86–100.16 ms（YUYV 640x480 @10fps）。MIPI（rkisp）仍待 OV5695 到货后复测 |
 | H3 | IMU660RB 的 WHO_AM_I | 读寄存器 `0x0F`，期望 `0x6B`（LSM6DSR 家族） | 芯片身份确认 | ✅ 已验证 2026-11-13：`imu_logger.py` 的 ID 检查通过才采样，60 s 采到 12000 采样（200.0 Hz，抖动 std 0.10 ms），即 WHO_AM_I = 0x6B |
-| H4 | INT1/INT2 接到 40-pin 的哪两个 GPIO | 用户确认接线 | DRDY 支持（M2）的前提 | ✅ 已确认 2026-11-13：INT1→20 脚，INT2→22 脚；但 20 脚是 GND（树莓派兼容排布），INT1 实际接地、不可用，启用 INT1 功能前必须改接到空闲 GPIO；INT2→22 脚 = GPIO25，可用。DRDY（M2）先用 INT2 |
+| H4 | INT1/INT2 接到 40-pin 的哪两个 GPIO | 用户确认接线 | DRDY 支持（M2）的前提 | ✅ 已确认 2026-11-13：INT1 原接 20 脚（GND，树莓派兼容排布），不可用；同日已改接到 16 脚 = GPIO23，现可用。INT2→22 脚 = GPIO25，可用。DRDY（M2）先用 INT2，INT1 为备用 |
 | H5 | `/dev/spidev3.0` 重启后是否还在 | 重启后 `ls /dev/spidev*` | spidev 绑定持久化方案 | ❌ 已确认 2026-11-13：重启后 `/dev/spidev3.0` 消失，driver_override 绑定不持久；修复：`spidev-bind.service` 开机自动重绑（Gitee，待重启验证），长期方案为 DTS 改 spidev 节点 |
-| H6 | SPI 最高可用速率与误码 | 1 MHz / 5 MHz 下连续读取测试 | `imu.rate_hz` 上限 | ✅ 已验证 2026-11-13：1 MHz（60 s，200.0 Hz，抖动 0.10 ms）与 5 MHz（20 s，200.0 Hz，抖动 0.06 ms）下 200 Hz 轮询均零丢样；5 MHz 可用 |
+| H6 | SPI 最高可用速率与误码 | 1 MHz / 5 MHz 下连续读取测试 | `imu.rate_hz` 上限 | ✅ 已验证 2026-11-13：1 MHz（60 s，200.0 Hz，抖动 0.10 ms）与 5 MHz（20 s，200.0 Hz，抖动 0.06 ms）下 200 Hz 轮询均零丢样；5 MHz 可用。**另：多字节自增读在该板上返回错误数据**（2026-11-13 块读与单读对照确认：单读数据全对——温度 21.5°C、陀螺零点几度/秒、|加速度| 0.98g），IMU 驱动须逐字节单读；5 MHz 单读已验证（10 s，200.0 Hz，抖动 0.07 ms，数据正确，零偏与 1 MHz 一致） |
 | H7 | eMMC 持续写速度（MJPEG 1080p30 码率下） | 板上写盘测试 | 队列容量与存储保护阈值 | ✅ 已验证 2026-11-13：`/userdata` 上 `dd` 200 MiB + fsync = 37.0 MB/s，远高于 MJPEG 1080p30 所需（约 5–10 MB/s），写盘不是瓶颈 |
 | H8 | OV5695 到货后：MIPI 节点、驱动、NV12 输出 | `v4l2-ctl` + 试采 | **M1 B 段的门** |
 | H9 | 实际帧大小与队列内存占用（NV12 1080p） | 板上录制实测，核对 64 MiB 上限 | §5.1 队列字节上限（现为工程直觉，未验证） |
@@ -719,6 +719,5 @@ M1 分 A/B 两段。OV5695 模块未到货，M1 不整体阻塞：A 段不依赖
    不得先假定。
 3. V4L2 驱动时间戳时钟域与语义（H2）：结果决定 §6.2 采用直取、EOF 修正、
    偏差补偿还是降级用 `t_read`。
-4. IMU DRDY 接线（H4）：未确认前 M2 的 DRDY 支持无法排期。
-5. `video.avi` 的 MJPEG 封装细节（AVI muxer 选型）待 M1 第 5 步确定。
-6. Video 队列 64 MiB 上限为工程直觉，待 H9 实测调整。
+4. `video.avi` 的 MJPEG 封装细节（AVI muxer 选型）待 M1 第 5 步确定。
+5. Video 队列 64 MiB 上限为工程直觉，待 H9 实测调整。
