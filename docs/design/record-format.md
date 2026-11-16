@@ -35,7 +35,6 @@
   "width": 2592,
   "height": 1944,
   "timestamp_semantics": "sof",
-  "clock_offset_ns": null,
   "fps_actual": 30.045,
   "imu_rate_actual_hz": 208.0,
   "errors": []
