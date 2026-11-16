@@ -54,7 +54,7 @@
 
 | 路径 | 内容 | 谁写 | 更新/回滚时 |
 |---|---|---|---|
-| `/etc/tspi-cam/actiond.toml` | **基础层**：安装器/镜像写的默认值（设备节点、分辨率、码率、队列、存储阈值） | 安装器 | 随安装包替换 |
+| `/etc/tspi-cam/actiond.toml` | **基础层**：安装器/镜像写的默认值（设备节点、分辨率、码率、队列、存储阈值） | 安装器 | **升级时被安装包覆盖**（用户改动只存在 `/var/lib` 层） |
 | `/var/lib/tspi-cam/actiond.toml` | **用户层**：只写在这台设备上改过的键；按表 key-by-key 合并覆盖基础层 | **只有 `actiond`**（经 IPC `device.config.set`；`uid`/`actionctl` 不直接写文件） | 升级、回滚都不动 |
 | `/var/lib/tspi-cam/calibration.json` | 每台设备一份：内参、IMU 偏置、外参、时间偏移 | `actioncal`（以 `tspi-cam` 身份运行，见 §3） | 不动；`actiond` 启动时读入 |
 | `/var/lib/tspi-cam/device.json` | 设备寿命记录：首次启动、累计录制裁数/时长、错误计数 | `actiond` | 不动 |
@@ -68,7 +68,7 @@
 | 目录 | 属主:组 | 模式 | 理由 |
 |---|---|---|---|
 | `/run/tspi-cam` | `root:video` | 0755 | socket 由 systemd 建；`actioncal`/`uid` 能穿过目录但不需要写 |
-| `/var/lib/tspi-cam` | `tspi-cam:video` | 0755 | `actiond` 写用户层/装置记录；`actioncal` 以 `tspi-cam` 写 `calibration.json`（`tspi-cam:video 0664`） |
+| `/var/lib/tspi-cam` | `tspi-cam:video` | 0755 | `actiond` 写用户层/装置记录；`actioncal` 以 `tspi-cam` 写 `calibration.json`（`tspi-cam:tspi-cam 0644`，`actiond` 以 owner 读） |
 | `/userdata/rec` | `tspi-cam:video` | 0775 | 录制目录 |
 
 安装与升级的**布局、原子切换、udev、回滚检查表**归 [deploy.md](deploy.md)（README 已分配）；
@@ -94,10 +94,10 @@ flowchart LR
   理由：非 root 的 `actiond` 不可能 `chown` 成 `root:video`（实测 EPERM）。
 - **`actiond.service` 不设 `RuntimeDirectory=`**：那会把已存在的 `/run/tspi-cam` 递归 chown 成
   `tspi-cam:tspi-cam`，破坏 socket 的 `root:video` 契约，stop 时还会删掉 socket 目录项。
-  目录由 `tmpfiles.d/tspi-cam.conf` 建（`d /run/tspi-cam 0775 root video -`）。
-- **组**：安装器执行 `usermod -aG video k` 且 `usermod -aG input k`（后者只为 Xorg 打开
-  `/dev/input/event*`；`uid` 读 X11 事件，不需要 `input`），`k` 必须重新登录。`actiond` 用
-  `SupplementaryGroups=video`。
+  目录由 `tmpfiles.d/tspi-cam.conf` 建（`d /run/tspi-cam 0755 root video -`）。
+- **组（结论，命令归 deploy.md）**：`actiond` ∈ `video`（`SupplementaryGroups=video`）；
+  操作员 `k` ∈ `video`（连 socket、读 DRM）；`k` ∈ `input` **只在 Xorg 改由 `k` 运行时才需要**——
+  当前 Xorg 是 root，`uid` 读 X11 事件，两者都不需要 `input`。
 - **Xorg 运行身份**：`xorg.service` 以 **root + `-ac`** 启动（`Xorg :0 -ac -nolisten tcp vt7`），
   这是 demo 的信任边界：本机可信、X socket 不暴露网络。`uid.service` 因此不需要
   `XAUTHORITY`。以 `k` 启动 Xorg 需要 logind seat + tty 权限，**在本镜像上未验证**（`UNVERIFIED`，

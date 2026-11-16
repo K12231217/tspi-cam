@@ -13,7 +13,7 @@
 | capture-encode.md | V4L2/MPP 实现细节：dmabuf 路线、线程/队列、帧率上限（stride 定义归 interfaces） | 待写（实测数据见 `../architecture.md` §16 H9–H16） |
 | ui.md | 显示/触摸：Xorg + libmali EGL + egui，预览变换与触摸映射 | 待写（决策与实测见 `../research/ui-stack-decision.md`） |
 | calibration.md | `actioncal` 与 `actiond` 的设备锁、交接流程、时间同步/空间对齐方法论 | 待写 |
-| [deploy.md](deploy.md) | 交叉编译、安装布局、systemd 单元与切换、udev、组、回滚与验收检查表 | 已定（2026-11-16） |
+| [deploy.md](deploy.md) | 交叉编译、安装布局、systemd 单元与切换、udev、组/账号的安装动作、回滚与验收检查表 | 已定（2026-11-16） |
 | gates.md | `cargo xtask` 门禁：arch/ipc/test/docs/smoke/size 与负向验证方法 | 待写 |
 
 旧的 `../architecture.md`（v1.2，中文）保留为**历史与实测记录**（H1–H16、队列/编码/UI 的板上数据）；

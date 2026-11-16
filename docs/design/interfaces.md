@@ -49,7 +49,7 @@ alias）或 `cargo xtask` 内部显式传 `--target`。host 测试与板端验�
 pub struct MonoTime(pub u64);                 // CLOCK_MONOTONIC 纳秒
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TsSource { Sof, Eof, Dequeue }       // MIPI 语义待 H13 核实后固定
+pub enum TsSource { Sof, Eof, Dequeue, Unknown } // MIPI 语义待 H13 核实；未知必须显式 Unknown
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Geometry { pub w: u32, pub h: u32 }
@@ -68,7 +68,7 @@ pub trait Timebase: Send + Sync {
     fn now(&self) -> MonoTime;
     /// 驱动时间戳 -> 单调时钟；offset 启动时测一次中值，写入 index.json.clock_offset_ns。
     fn from_driver(&self, raw: i64, src: TsSource) -> MonoTime;
-    /// 写入 index.json.timestamp_semantics；未知时返回 TsSource::Dequeue 并标 unknown。
+    /// 写入 index.json.timestamp_semantics；核实前返回 Unknown（不得猜成 Dequeue）。
     fn semantics(&self) -> TsSource;
 }
 ```
@@ -210,8 +210,9 @@ total        = stride*vstride*3/2                  // 实测 sizeimage = 7_558_2
 
 `vstride == h` 只是**本板实测**，不是契约：驱动给了填充就必须按 `vstride` 跳行。
 
-- `w` 与 `stride` 是**两个不同的量**：`planes()` 返回整段 `stride*h`，消费方必须用
-  `stride` 跳行，不能用 `w`。
+- `w`、`stride`、`vstride` 是**三个不同的量**：`planes()` 返回的切片长度是 `stride*vstride`
+  （chroma 为 `stride*(vstride/2)`），消费方必须用 `stride` 跳行、用 `vstride` 计算平面高度，
+  不能用 `w`/`h` 代替。
 - 编码器收到 `stride != w` 时必须显式设置水平步幅（`mpp_frame_set_hor_stride`）；
   RGA 路径同样按 stride 传。**任何"顺手重新打包成 w 紧凑排布"的实现都算违约**（多一次全帧拷贝）。
 - 若驱动给出 `stride < w`，视为 `CaptureError::BadStride`，不允许继续。

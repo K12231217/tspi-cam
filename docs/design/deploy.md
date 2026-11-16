@@ -45,8 +45,8 @@ d /userdata/rec 0775 tspi-cam video -
 安装器另外执行（**需要重新登录才生效**）：
 
 ```bash
-usermod -aG video k      # 连 socket、读 /dev/dri（Xorg 以 root 跑时这条只对 uid/actionctl 有意义）
-usermod -aG input k      # 仅当 Xorg 改由 k 运行时才需要；当前 xorg.service 是 root
+usermod -aG video k      # actionctl/uid 连 socket、读 /dev/dri
+# usermod -aG input k    # 仅当 Xorg 改由 k 运行时才执行（当前 xorg.service 以 root 运行）
 ```
 
 - `actiond.service`：`User=tspi-cam`、`SupplementaryGroups=video`、**不设 `RuntimeDirectory=`**
@@ -65,7 +65,7 @@ ListenStream=/run/tspi-cam/media.sock
 SocketMode=0660
 SocketUser=root
 SocketGroup=video
-DirectoryMode=0775
+DirectoryMode=0755
 
 # actiond.service
 [Service]
