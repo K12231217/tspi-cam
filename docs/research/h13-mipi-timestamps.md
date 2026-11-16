@@ -54,3 +54,23 @@ ssh k@<board> 'python3 /tmp/h13_probe.py /dev/video0 2592 1944 5'
 ```
 
 前提：`k` 在 `video` 组（`/dev/video0` 是 `0660 root:video`）。
+
+## 本仓 V4L2 绑定在板上的实测（2026-11-16）
+
+`examples/capture_probe`（static musl）以 `k` 用户直接运行，**不需要 sudo**（`k` 在 `video` 组，
+`/dev/video0` 是 `0660 root:video`）：
+
+```text
+./capture_probe /dev/video0 1920 1080 30 20
+started 1920x1080 fps=30 format=Nv12 stride=1920 vstride=1080
+frame id=0 pts=2307026703000ns luma=2073600B chroma=1036800B
+done: 20 frames in 0.685s = 29.21 fps; stats=PoolStats { dequeued: 20, returned: 20, return_errors: 0, gap_frames: 0 }
+
+./capture_probe /dev/video0 2592 1944 30 10
+started 2592x1944 fps=30 format=Nv12 stride=2592 vstride=1944
+done: 10 frames in 0.354s = 28.29 fps; stats=PoolStats { dequeued: 10, returned: 10, return_errors: 0, gap_frames: 0 }
+```
+
+平面字节数正好等于 `sizeimage`（1080p 3,110,400；5MP 7,558,272），`pts` 单调递增，
+`gap_frames`/`return_errors` 为 0。即：**Pool 的 mmap 槽位、按 `index` 租还、QBUF 归还链路
+在真实驱动上闭环**（host 侧已有并发与 poison 用例覆盖）。
