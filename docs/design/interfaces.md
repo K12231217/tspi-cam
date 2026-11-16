@@ -41,10 +41,11 @@ alias）或 `cargo xtask` 内部显式传 `--target`。host 测试与板端验�
 
 ## 2. 契约层（`action-contract`，零依赖）
 
-先定义所有跨模块共用的基础类型（`action-core::types`，`action-contract` 只用不定义语义）：
+先定义所有跨模块共用的基础类型。**归属**：这些类型在 `action-core::types`；`action-contract`
+只有常量，保持零依赖、无 serde。wire 侧用 `ipc` 的 `pts_ns: u64`，不跨层复用 `MonoTime`。
 
 ```rust
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct MonoTime(pub u64);                 // CLOCK_MONOTONIC 纳秒
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -61,6 +62,15 @@ pub enum PixelFormat { Nv12 }
 pub struct FramePlanes { pub luma: (usize, usize), pub chroma: (usize, usize) }
 
 pub const EMPTY_PLANES: FramePlanes = FramePlanes { luma: (0, 0), chroma: (0, 0) };
+
+/// 全系统唯一时间基准。五个时间点与离线对齐的细节归 timebase.md；这里只钉接口。
+pub trait Timebase: Send + Sync {
+    fn now(&self) -> MonoTime;
+    /// 驱动时间戳 -> 单调时钟；offset 启动时测一次中值，写入 index.json.clock_offset_ns。
+    fn from_driver(&self, raw: i64, src: TsSource) -> MonoTime;
+    /// 写入 index.json.timestamp_semantics；未知时返回 TsSource::Dequeue 并标 unknown。
+    fn semantics(&self) -> TsSource;
+}
 ```
 
 ```rust
@@ -125,7 +135,7 @@ pub struct FrameLease {
     pub pts: MonoTime,      // = timebase.from_driver(v4l2_buffer.timestamp, src)
     pub geom: Geometry,
     pub format: PixelFormat,
-    pub stride: u32,        // 水平步幅，见 §3.2
+    pub stride: u32,        // 水平步幅，见 §3.3
     pub vstride: u32,       // 垂直步幅；本板两种模式都等于 h
     planes: FramePlanes,
     buf: BufferIndex,
@@ -133,7 +143,7 @@ pub struct FrameLease {
 }
 impl FrameLease {
     /// 视图生命周期绑定 `&self`；不存在 `&'static` 版本（否则 lease drop 后仍可读，见 review E3）。
-    pub fn planes(&self) -> FramePlanes<'_>;
+    pub fn planes(&self) -> [&[u8]; 2];   // [luma, chroma]
     /// dmabuf 导出（v2 优化）：v1 不实现，返回 `None`；有它时编码器可直接拿 fd。
     pub fn dmabuf(&self) -> Option<std::os::fd::BorrowedFd<'_>>;
 }
@@ -180,30 +190,25 @@ pub trait FrameSource: Send {
   `queue_dropped`（应用侧溢出）。`record.status`/`record.progress`/`index.json` 都按
   `{gap_frames,queue_dropped}` 分别上报，不允许合并成一个数；`record.event` 只报事件本身。
 
-### 3.1 生命周期与所有权
+### 3.2 生命周期（概念图）
 
 ```text
-capture: dqbuf → lease (InFlight) ──queue──▶ encode: submit(lease) ──▶ 等该帧的 packet
-                                                    │                        │
-                                                    └────── 归还 ◄───────────┘
+capture: dqbuf -> lease --queue--> encode: submit(lease) --> packet(frame_id) -> Drop -> QBUF
 ```
 
-- **`submit()` 返回不代表硬件读完**。MPP 是异步的：`encode_put_frame` 之后硬件在任务里读输入。
-  契约规定：**编码器内部保存输入 lease 的 FIFO；每次 `poll()` 收到一个 packet，就释放 FIFO 头部
-  的 lease**，从而实现"packet 出 → 输入 buffer 可归还"。
-- 前提：`bframes = 0` 且编码器对每个输入帧恰好产生一个 packet。**这条要在板上验证**（600 帧：
-  `submits == packets`，顺序一致）。若不成立，`poll()` 返回
-  `EncodeError::LifecycleMismatch`（`E_ENC_LIFECYCLE`），**不静默丢帧**。
-- `flush()`：发 EOS 后把 FIFO 里剩余 lease 全部归还，再返回；期间 `poll()` 允许返回 `None`。
+`submit()` 返回**不代表**硬件读完；归还时机与配对规则见 §4（按 `frame_id`，不是 FIFO 位置）。
 
-### 3.2 步幅（stride）的精确定义
+### 3.3 步幅（stride）的精确定义
 
 ```text
-stride = V4L2 plane_fmt[0].bytesperline        // 单位：字节；本板 2592×1944 实测 = 2592
-luma plane   = [0, stride*h)                   // 有效行宽 w，行尾 [w, stride) 是填充
-chroma plane = [stride*h, stride*h + stride*(h/2))
-total        = stride*h*3/2                    // 实测 sizeimage = 7_558_272，与上式一致
+stride  = V4L2 plane_fmt[0].bytesperline           // 水平步幅；本板 2592x1944 实测 2592
+vstride = plane_fmt[0].sizeimage / (stride*3/2)    // 垂直步幅；本板两种模式实测都等于 h
+luma plane   = [0, stride*vstride)
+chroma plane = [stride*vstride, stride*vstride + stride*(vstride/2))
+total        = stride*vstride*3/2                  // 实测 sizeimage = 7_558_272
 ```
+
+`vstride == h` 只是**本板实测**，不是契约：驱动给了填充就必须按 `vstride` 跳行。
 
 - `w` 与 `stride` 是**两个不同的量**：`planes()` 返回整段 `stride*h`，消费方必须用
   `stride` 跳行，不能用 `w`。
@@ -336,7 +341,13 @@ impl Recorder {
    必须返回 `Err(CaptureError::Stopped)`，不是 `Ok(None)`。
 5. **fd 归属**：`BufferPool::new` 之后关掉调用方 fd，池仍能 QBUF（内部 dup 生效）；池析构后
    `close` 恰好一次。
-6. **驱动丢帧计数**：mock 的 `sequence` 跳号（…, 41, 45, …）→ `stats.gap_frames == 3`，且
-   `record.event` 里 `dropped` 的两个来源分别上报（`gap_frames` / `queue_dropped`）。
-7. **编码器配对**：mock 编码器提交 N 帧、吐 N 个 packet，`in_flight == 0`；故意少吐一个 packet →
-   `lifecycle_errors == 1` 且返回 `E_ENC_LIFECYCLE`（不允许静默丢）。
+6. **驱动丢帧计数**：mock 的 `sequence` 跳号（41, 45, ...）→ `stats.gap_frames == 3`；
+   `record.status`/`record.progress`/`index.json` 的对象里两来源分别上报；`record.event`
+   只断言 `class/code`（事件不带计数）。
+7. **编码器配对**：mock 提交 N 帧、吐 N 个 packet，`in_flight == 0`；跳过一个 id 时
+   `skipped == 1 && in_flight == 0`（不报错）；只有 `flush(deadline)` drain 完仍有残留才
+   `lifecycle_errors == 1` 且返回 `E_ENC_LIFECYCLE`。
+8. **归还不得早于 packet**：mock 记录每次 QBUF 的 `frame_id` 顺序，断言 `qbuf(i)` 发生在
+   `poll()` 产出 `frame_id == i` 之后（不允许 submit 即刻归还）。
+9. **flush 顺序**：`submit_eos` 之后 `flush(deadline)` 会逐个产出剩余 packet 并归还，
+   期间 `in_flight` 单调下降；deadline 到期仍有残留才报错。

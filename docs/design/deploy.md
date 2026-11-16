@@ -37,7 +37,8 @@ m tspi-cam video
 
 ```ini
 # /etc/tmpfiles.d/tspi-cam.conf
-d /run/tspi-cam 0775 root video -
+d /run/tspi-cam 0755 root video -
+d /var/lib/tspi-cam 0755 tspi-cam video -
 d /userdata/rec 0775 tspi-cam video -
 ```
 
@@ -50,8 +51,9 @@ usermod -aG input k      # 仅当 Xorg 改由 k 运行时才需要；当前 xorg
 
 - `actiond.service`：`User=tspi-cam`、`SupplementaryGroups=video`、**不设 `RuntimeDirectory=`**
   （原因见 architecture §3：会破坏 socket 属主）。
-- `/var/lib/tspi-cam` 归 `tspi-cam:video 0775`：`actiond` 写用户层与 `device.json`；
-  `actioncal`（以 `tspi-cam` 运行）写 `calibration.json`；`device.lock` 也在这里（不是 `/run`）。
+- `/var/lib/tspi-cam` 归 `tspi-cam:video **0755**`：写者全是 `tspi-cam`（actiond 写用户层与
+  `device.json`，actioncal 以 `tspi-cam` 写 `calibration.json`），组只读即可；
+  `device.lock` 也在这里（不是 `/run`）。
 
 ## 3. systemd 单元（要点）
 
@@ -141,7 +143,8 @@ systemctl restart actiond.service uid.service
 | 2 | `stat -c '%a %U:%G' /run/tspi-cam/*.sock` | `660 root:video` |
 | 3 | `sudo -u k /opt/tspi-cam/current/bin/actionctl hello` | 返回 `api_version` |
 | 4 | `sudo -u tspi-cam test -r /dev/video0 -a -w /dev/mpp_service -a -r /dev/spidev3.0 -a -r /dev/rga` | 全可读/写 |
-| 5 | `sudo -u tspi-cam test -r /dev/dma_heap/system` | `UNVERIFIED`（v2 才需要；失败记录，不阻塞 v1） |
+| 5 | `stat -c "%U:%G %a" /var/lib/tspi-cam && sudo -u tspi-cam touch /var/lib/tspi-cam/.probe` | `tspi-cam:video 755`，可写 |
+| 5b | `sudo -u tspi-cam test -r /dev/dma_heap/system` | `UNVERIFIED`（v2 才需要；失败记录，不阻塞 v1） |
 | 6 | `actionctl record.start` + 5 s + `record.stop` | `index.json.complete == true`，`frames > 0` |
 | 7 | 回滚到上一版并重复 1–3 | 全部通过，旧录制仍可 `record.list` |
 | 8 | `systemctl is-active spidev-bind.service` | `active (exited)`；失败时 `actiond` 报 `E_HW` 而不是崩溃 |

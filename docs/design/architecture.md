@@ -11,7 +11,7 @@
 **两个守护进程 + 一个 CLI + 一个离线标定工具**，全部通过 Unix socket 讲同一份 JSON-RPC。
 
 ```text
-  touchscreen ── USB HID ──▶ xorg(:0, user k) ── X11 pointer/XI2 ──▶ uid ──┐
+  touchscreen ── USB HID ──▶ xorg(:0, root -ac) ── X11 pointer/XI2 ──▶ uid ──┐
         ▲                          │  (libinput 独占 evdev)                  │ record.*
         └──── HDMI/DRM ────────────┘  画面：libmali EGL + egui              │ media.frame
                                  ┌───────────────────────────────────┐      │
@@ -33,7 +33,7 @@
 | 服务 | 拥有 | 监听 | 只连 |
 |---|---|---|---|
 | `actiond` | **相机、IMU、硬件编码器、录制状态机、存储保护**；`record.*` | `/run/tspi-cam/record.sock` | `/dev/video0`、`/dev/spidev3.0`、`/dev/mpp_service`、`/userdata` |
-| `xorg` | **显示与输入**：HDMI 480×800@60、libinput 独占触摸 evdev；以操作员账号 `k` 运行 | `:0`（X socket） | `/dev/dri/card0`、`/dev/input/event*` |
+| `xorg` | **显示与输入**：HDMI 480×800@60、libinput 独占触摸 evdev；**root + `-ac`**（`k` 运行版本 UNVERIFIED） | `:0`（X socket） | `/dev/dri/card0`、`/dev/input/event*` |
 | `uid` | UI 进程：X11 客户端 + egui + libmali EGL；**不读 evdev、不碰采集设备** | 不监听（纯客户端） | `actiond`（`record.*` + `media.frame`）、`xorg`（`DISPLAY=:0`） |
 | `actionctl` | 无 | 无 | `actiond` |
 | `actioncal` | 无（运行时）；离线标定文件 | 无 | `actiond` 的 `device.lock`（flock 互斥），然后独占硬件 |
@@ -67,8 +67,8 @@
 
 | 目录 | 属主:组 | 模式 | 理由 |
 |---|---|---|---|
-| `/run/tspi-cam` | `root:video` | 0775 | socket 由 systemd 建；`actioncal`/`uid` 能穿过目录但不需要写 |
-| `/var/lib/tspi-cam` | `tspi-cam:video` | 0775 | `actiond` 写用户层/装置记录；`actioncal`（`video` 组）写 `calibration.json`，文件属主 `k:video` 0664 |
+| `/run/tspi-cam` | `root:video` | 0755 | socket 由 systemd 建；`actioncal`/`uid` 能穿过目录但不需要写 |
+| `/var/lib/tspi-cam` | `tspi-cam:video` | 0755 | `actiond` 写用户层/装置记录；`actioncal` 以 `tspi-cam` 写 `calibration.json`（`tspi-cam:video 0664`） |
 | `/userdata/rec` | `tspi-cam:video` | 0775 | 录制目录 |
 
 安装与升级的**布局、原子切换、udev、回滚检查表**归 [deploy.md](deploy.md)（README 已分配）；

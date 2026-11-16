@@ -34,6 +34,8 @@
   "codec": "h264",
   "width": 2592,
   "height": 1944,
+  "timestamp_semantics": "sof",
+  "clock_offset_ns": null,
   "fps_actual": 30.045,
   "imu_rate_actual_hz": 208.0,
   "errors": []
@@ -51,6 +53,8 @@
 | `bytes` | u64 | 目录总字节数 |
 | `codec` | `"h264"`/`"h265"` | 与 `video.mkv` 一致 |
 | `width`/`height` | u32 | 编码分辨率（`encode.geom`，不是 sensor 分辨率） |
+| `timestamp_semantics` | `"sof"`/`"eof"`/`"dequeue"`/`"unknown"` | MIPI 驱动时间戳语义（H13 核实后写死，未知不得猜） |
+| `clock_offset_ns` | i64? | 驱动时钟与 `CLOCK_MONOTONIC` 的偏差中值；同域时为 null |
 | `fps_actual` | f64 | `frames / duration`（实测值，不是目标 30） |
 | `imu_rate_actual_hz` | f64 | `imu_samples / duration` |
 | `errors` | `[{class, code, message, at_mono_ns}]` | 与 `record.event` 同源；空数组不是 null |

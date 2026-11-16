@@ -247,7 +247,7 @@ pub enum Event {
   `media.unsubscribe` 或关闭连接即停止（不需要 1:1 的退订确认）。
 - 服务端对慢客户端**丢帧不阻塞**：发送队列上限 2 帧，满则丢最旧帧并计入 `stats.preview_dropped`；
   永不反压采集/编码。
-- 负载格式 NV12，按 `stride` 排布（[interfaces.md](interfaces.md) §3.2）。一帧 1080p 有 3.1 MB，
+- 负载格式 NV12，按 `stride` 排布（[interfaces.md](interfaces.md) §3.3）。一帧 1080p 有 3.1 MB，
   所以它**永不进入控制通道**，也永远不参与 `Call` 路由。
 
 ### 3.5 录制状态取值（契约，不是实现细节）
@@ -263,6 +263,12 @@ pub enum Event {
 - **只读方法在所有状态均可用**：`record.status`、`record.get`、`record.list`、`device.info`、
   `device.config.get`、`system.log.tail` 不受上表限制；`record.subscribe` 在 `idle` 也可用
   （UI 启动先订阅再等录制）。"允许的调用"一列只约束**会改变状态**的方法。
+- 三个跨状态方法单独定：
+  | 方法 | 可用状态 | 语义 |
+  |---|---|---|
+  | `system.shutdown` | **所有状态** | 若在 `recording`/`stopping`，先走 `record.stop` 的 Finalize，再关机；`stopping` 期间收到则在 Finalize 结束后关机 |
+  | `device.config.set` | `idle`/`recording` | 只写用户层；**对下一次录制生效**，当前录制参数不变（`record.status.encode` 仍报当前值） |
+  | `record.delete` | `idle`/`recording` | 只能删**非当前** `rec_id`；删当前录制 → `E_STATE{reason:"recording"}`；`stopping` 期间 → `busy_stopping` |
 - `E_STATE` 的 `data.reason` 取值固定为 `{already_recording, not_recording, busy_stopping, recording, fault}`，
   客户端按 `reason` 分支，**不解析 `message` 文本**。
 - `fault` 不在 `state` 里：故障表现为"记录未完成"（`index.json.complete=false`）+ `record.event`
