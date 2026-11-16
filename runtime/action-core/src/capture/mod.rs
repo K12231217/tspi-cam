@@ -9,6 +9,7 @@ use thiserror::Error;
 use crate::types::{Geometry, PixelFormat};
 
 pub mod pool;
+pub use pool::FrameLease;
 #[cfg(target_os = "linux")]
 pub mod v4l2;
 
