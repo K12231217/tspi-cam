@@ -29,8 +29,16 @@ impl OrientationEstimator {
     /// `[w, x, y, z]` after the update.
     pub fn update(&mut self, sample: &ImuSample) -> [f64; 4] {
         self.vqf.update(
-            [sample.gx as f64, sample.gy as f64, sample.gz as f64],
-            [sample.ax as f64, sample.ay as f64, sample.az as f64],
+            [
+                sample.gyro[0] as f64,
+                sample.gyro[1] as f64,
+                sample.gyro[2] as f64,
+            ],
+            [
+                sample.accel[0] as f64,
+                sample.accel[1] as f64,
+                sample.accel[2] as f64,
+            ],
             None,
         );
         self.quat_6d()
@@ -62,13 +70,10 @@ mod tests {
     fn static_sample_converges_to_identity_and_rest() {
         let mut est = OrientationEstimator::new(0.005);
         let sample = ImuSample {
-            timestamp_ns: 0,
-            gx: 0.0,
-            gy: 0.0,
-            gz: 0.0,
-            ax: 0.0,
-            ay: 0.0,
-            az: 9.81,
+            t: crate::types::MonoTime(0),
+            gyro: [0.0, 0.0, 0.0],
+            accel: [0.0, 0.0, 9.81],
+            raw: [0; 6],
         };
         let mut q = [1.0, 0.0, 0.0, 0.0];
         for _ in 0..600 {
