@@ -49,7 +49,7 @@ alias）或 `cargo xtask` 内部显式传 `--target`。host 测试与板端验�
 pub struct MonoTime(pub u64);                 // CLOCK_MONOTONIC 纳秒
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TsSource { Sof, Eof, Dequeue, Unknown } // MIPI 语义待 H13 核实；未知必须显式 Unknown
+pub enum TsSource { Sof, Eof, Dequeue, Unknown } // MIPI 实测 Eof（H13，2026-11-16）；未知仍必须 Unknown
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Geometry { pub w: u32, pub h: u32 }
@@ -165,6 +165,7 @@ pub trait FrameSource: Send {
 
 ### 3.0 内存模型（v1 说清楚，不假装零拷贝）
 
+- **板上节点是 multiplanar**：`V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE`、`v4l2_format` 208 B、`v4l2_buffer` 88 B + `v4l2_plane` 数组；`plane_fmt[0].sizeimage`/`bytesperline` 在本内核分别位于 `v4l2_format` 偏移 28/32（`tools/hil/h13_probe.py` 实测，勿照抄 mainline 头文件）。
 - **v1 使用 V4L2 `mmap` 缓冲**（与已验证的 gst 路径一致），**不调用 `VIDIOC_EXPBUF`**。
   因此 `FrameLease` 只提供 CPU 视图；`dmabuf()` 返回 `None`。
 - MPP 编码器接收的是"用户内存 + 步幅"（`mpp_frame_set_buffer` 包装），**不假设硬件直接读这块内存**；

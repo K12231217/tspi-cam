@@ -52,7 +52,7 @@
 | `bytes` | u64 | 目录总字节数 |
 | `codec` | `"h264"`/`"h265"` | 与 `video.mkv` 一致 |
 | `width`/`height` | u32 | 编码分辨率（`encode.geom`，不是 sensor 分辨率） |
-| `timestamp_semantics` | `"sof"`/`"eof"`/`"dequeue"`/`"unknown"` | MIPI 驱动时间戳语义（H13 核实后写死，未知不得猜） |
+| `timestamp_semantics` | `"sof"`/`"eof"`/`"dequeue"`/`"unknown"` | MIPI 驱动时间戳语义；2026-11-16 H13 实测为 **`"eof"`**（`flags=0x00002001`），未知不得猜 |
 | `clock_offset_ns` | i64? | 驱动时钟与 `CLOCK_MONOTONIC` 的偏差中值；同域时为 null |
 | `fps_actual` | f64 | `frames / duration`（实测值，不是目标 30） |
 | `imu_rate_actual_hz` | f64 | `imu_samples / duration` |
