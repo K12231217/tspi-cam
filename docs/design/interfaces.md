@@ -292,8 +292,8 @@ pub trait ImuSource: Send {
 }
 ```
 
-硬约束：**单字节读**（H6：多字节自增读返回错数据）；ODR 默认 208（配置项）；换算系数在
-`action-contract`。
+硬约束：**单字节读**（H6：本板多字节自增读返回冻结/错位数据，`docs/research/imu-spi-notes.md`）；
+ODR 默认 208（配置项）；换算系数在 `action-contract`；节点权限靠 udev（`deploy.md` §4），不靠 sudo。
 
 ## 7. 写盘接口
 

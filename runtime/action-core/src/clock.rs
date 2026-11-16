@@ -8,6 +8,7 @@
 //! implementation plus a controllable mock for host tests.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::types::{MonoTime, TsSource};
@@ -24,19 +25,30 @@ pub trait Timebase: Send + Sync {
 }
 
 /// Monotonic clock backed by `Instant`, offset for driver timestamps.
+/// Process-wide monotonic epoch. Every `SystemTimebase` shares it, so
+/// timestamps from different modules are comparable (per-instance `Instant`s
+/// are not).
+fn epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
 #[derive(Debug)]
 pub struct SystemTimebase {
-    start: Instant,
     offset_ns: AtomicI64,
     semantics: TsSource,
 }
 
 impl SystemTimebase {
+    /// Monotonic "now" on the shared process epoch.
+    pub fn system_now() -> MonoTime {
+        MonoTime(epoch().elapsed().as_nanos() as u64)
+    }
+
     /// `offset_ns` is the median of `driver_raw - monotonic_ns` measured over a
     /// startup burst; `semantics` stays `Unknown` until H13 is closed.
     pub fn new(offset_ns: i64, semantics: TsSource) -> Self {
         Self {
-            start: Instant::now(),
             offset_ns: AtomicI64::new(offset_ns),
             semantics,
         }
@@ -59,7 +71,7 @@ impl Default for SystemTimebase {
 
 impl Timebase for SystemTimebase {
     fn now(&self) -> MonoTime {
-        MonoTime(self.start.elapsed().as_nanos() as u64)
+        MonoTime(epoch().elapsed().as_nanos() as u64)
     }
 
     fn from_driver(&self, raw: i64, _src: TsSource) -> MonoTime {
