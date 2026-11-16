@@ -36,8 +36,5 @@ pub struct EncodedPacket {
     pub data: Vec<u8>,
 }
 
-// MPP binding status (2026-11-16, board-tested): `dlopen`-based bring-up
-// produced H.264 packets, but `MPP_ENC_SET_CFG` returned `MPP_ERR_VALUE` and
-// the stream stayed 1280x720 regardless of `prep:width/height` (cfg reads back
-// correctly). The encoder is therefore **not** wired into the pipeline yet;
-// evidence and next hypotheses: `docs/research/mpp-encoder-notes.md`.
+#[cfg(target_os = "linux")]
+pub mod mpp;
