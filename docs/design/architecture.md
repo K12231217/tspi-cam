@@ -54,74 +54,59 @@
 
 | 路径 | 内容 | 谁写 | 更新/回滚时 |
 |---|---|---|---|
-| `/etc/tspi-cam/recordd.toml` | **基础层**：安装器/镜像写的默认值（设备节点、分辨率、码率、队列、存储阈值） | 安装器 | 随安装包替换 |
-| `/var/lib/tspi-cam/recordd.toml` | **用户层**：只写在这台设备上改过的键；读取时按表 key-by-key 合并覆盖基础层 | `actionctl configure` / `uid` | 升级、回滚都不动 |
-| `/var/lib/tspi-cam/calibration.json` | 每台设备一份：内参、IMU 偏置、外参、时间偏移 | `actioncal` | 不动；`actiond` 启动时读入 |
-| `/var/lib/tspi-cam/device.json` | 设备寿命记录：首次启动、累计录制裁数/时长、错误计数（microduck `vetbook` 同思路） | `actiond` | 不动 |
-| `/run/tspi-cam/record.sock` | 控制/状态 socket，`0660 root:video` | systemd（`actiond.socket`） | 由 socket unit 管理 |
-| `/run/tspi-cam/media.sock` | 预览帧 socket（二进制帧 + JSON-RPC 头），`0660 root:video` | systemd（`actiond.socket`） | 由 socket unit 管理 |
-| `/run/tspi-cam/device.lock` | `flock` 独占锁：`actiond` 启动即持有，`actioncal` 抢锁 | 两者 | 内核释放，**文件残留不代表被占用** |
+| `/etc/tspi-cam/actiond.toml` | **基础层**：安装器/镜像写的默认值（设备节点、分辨率、码率、队列、存储阈值） | 安装器 | 随安装包替换 |
+| `/var/lib/tspi-cam/actiond.toml` | **用户层**：只写在这台设备上改过的键；按表 key-by-key 合并覆盖基础层 | **只有 `actiond`**（经 IPC `device.config.set`；`uid`/`actionctl` 不直接写文件） | 升级、回滚都不动 |
+| `/var/lib/tspi-cam/calibration.json` | 每台设备一份：内参、IMU 偏置、外参、时间偏移 | `actioncal`（以 `tspi-cam` 身份运行，见 §3） | 不动；`actiond` 启动时读入 |
+| `/var/lib/tspi-cam/device.json` | 设备寿命记录：首次启动、累计录制裁数/时长、错误计数 | `actiond` | 不动 |
+| `/var/lib/tspi-cam/device.lock` | `flock` 独占锁（**不在 `/run`**：socket activation 后 `/run/tspi-cam` 归 root，`k` 建不了文件） | `actiond` 写持有；`actioncal` 以 `O_RDONLY` flock | 内核释放，**文件残留不代表被占用** |
+| `/run/tspi-cam/record.sock` | 控制/状态 socket | systemd（`actiond.socket`） | 由 socket unit 管理 |
+| `/run/tspi-cam/media.sock` | 预览帧 socket（头 + 二进制负载） | systemd（`actiond.socket`） | 由 socket unit 管理 |
 | `/userdata/rec/rec-*/` | 录制产物：`video.mkv`、`frames.csv`、`imu.csv`、`index.json` | `actiond` | 从不进升级包 |
 
-安装与升级（细节归 [deploy.md](deploy.md)；本节只定所有权）：
+目录属主/模式（由 `tmpfiles.d` 与 `StateDirectory` 固定，不靠手工 chown）：
 
-```text
-/opt/tspi-cam/releases/<version>/bin/{actiond,uid,actionctl,actioncal}
-/opt/tspi-cam/releases/<version>/systemd/{actiond.service,actiond.socket,uid.service}
-/opt/tspi-cam/current -> releases/<version>
-/etc/systemd/system/{actiond.service,actiond.socket,uid.service}   # 安装器写入，指向 current/bin
-/etc/sysusers.d/tspi-cam.conf     # u tspi-cam；m tspi-cam video
-/etc/udev/rules.d/70-tspi-cam.rules
-```
+| 目录 | 属主:组 | 模式 | 理由 |
+|---|---|---|---|
+| `/run/tspi-cam` | `root:video` | 0775 | socket 由 systemd 建；`actioncal`/`uid` 能穿过目录但不需要写 |
+| `/var/lib/tspi-cam` | `tspi-cam:video` | 0775 | `actiond` 写用户层/装置记录；`actioncal`（`video` 组）写 `calibration.json`，文件属主 `k:video` 0664 |
+| `/userdata/rec` | `tspi-cam:video` | 0775 | 录制目录 |
 
-- **切换原子**：`ln -s releases/<v> current.tmp && mv -T current.tmp current`（同一文件系统上的 rename，
-  没有 unlink 窗口）。保留 `current` + 上一个版本，回滚 = 反向 rename + `systemctl restart`；
-  其余旧版本在健康检查通过后清理。
-- **unit 文件不进 release 的 symlink**：`/etc/systemd/system/*.service` 指向 `current/bin/*`，
-  因此切换版本不需要 `daemon-reload`；若某版本必须改 unit，安装器负责写入并 reload，且这一步
-  不算回滚安全点（写进 deploy.md 的升级检查表）。
-- 配置与录制数据路径与版本无关：`/etc/tspi-cam`、`/var/lib/tspi-cam`、`/userdata/rec` 不随 releases 移动。
+安装与升级的**布局、原子切换、udev、回滚检查表**归 [deploy.md](deploy.md)（README 已分配）；
+本节只保留所有权结论：release 目录在 `/opt/tspi-cam/releases/<version>`，`current` 是符号链接，
+配置与数据路径与版本无关。
 
 ## 3. 启动顺序与权限
 
 ```mermaid
 flowchart LR
-    sock["actiond.socket<br/>SocketMode=0660<br/>SocketGroup=video"]
+    sock["actiond.socket<br/>SocketMode=0660 · root:video"]
     ad["actiond.service<br/>User=tspi-cam<br/>SupplementaryGroups=video<br/>Requires=actiond.socket"]
-    x["xorg.service<br/>User=k · :0"]
-    ui["uid.service<br/>User=k · DISPLAY=:0<br/>After=xorg + actiond (Wants)"]
+    sp["spidev-bind.service<br/>（镜像提供）"]
+    x["xorg.service<br/>root · :0 -ac"]
+    ui["uid.service<br/>User=k · DISPLAY=:0<br/>After=xorg (Requires) + actiond (Wants)"]
+    sp --> ad
     sock --> ad
     ad --> ui
     x --> ui
 ```
 
-- **socket 由 systemd 创建，daemon 不自建、不 chown**。`actiond.socket` 声明
-  `ListenStream=/run/tspi-cam/record.sock` 与 `.../media.sock`、`SocketMode=0660`、
-  `SocketUser=root`、`SocketGroup=video`；`actiond` 以 `tspi-cam` 身份 `accept` 传入的 fd。
-  理由：非 root 的 `actiond` **不可能** `chown` 成 `root:video`（实测 EPERM），而 `RuntimeDirectory`
-  又保证目录属主是 `tspi-cam`；socket activation 让"属主"和"运行身份"解耦。
-- 客户端 `connect()` 需要 socket 的**写**权限，所以 `0660` 是下限，`0640` 连不上（unix(7)）。
-- **组**：安装器把操作员加入 `video`（`usermod -aG video k`），`k` 需要重新登录才生效；`actiond`
-  通过 `SupplementaryGroups=video` 拿到设备权限。`xorg` 同样以 `k` 运行，需要 `video`（DRM）与
-  `input`（evdev）——`input` 只给 Xorg，`uid` 不需要。
-- 设备访问全部由 `deploy/udev/70-tspi-cam.rules` 授权（当前 `/dev/spidev3.0` 是 `root:root 0600`）：
-
-  ```udev
-  KERNEL=="spidev3.0", GROUP="video", MODE="0660"
-  KERNEL=="mpp_service", GROUP="video", MODE="0660"
-  SUBSYSTEM=="video4linux", GROUP="video", MODE="0660"
-  KERNEL=="media[0-9]*", SUBSYSTEM=="media", GROUP="video", MODE="0660"
-  KERNEL=="card[0-9]", SUBSYSTEM=="drm", GROUP="video", MODE="0660"
-  KERNEL=="renderD*", SUBSYSTEM=="drm", GROUP="video", MODE="0660"
-  KERNEL=="rga", GROUP="video", MODE="0660"
-  ```
-
-  `spidev3.0` 开机时不存在（H5：driver_override 不持久），节点由 `spidev-bind.service` 创建后才
-  出现，因此该规则只能对"后出现"的设备生效：`actiond.service` 要 `After=spidev-bind.service`
-  （`Wants=`，失败不阻塞启动，`record.status` 报 `E_HW` 缺 IMU）。
-- `actioncal` 以 `k`（`video` 组）运行，与 `actiond` 抢 `device.lock`；标定期间 `actiond` 释放硬件。
-- **根目录/录制目录**：`/userdata/rec` 归 `tspi-cam`，`/var/lib/tspi-cam` 归 `tspi-cam`；
-  `/etc/tspi-cam` 由安装器写、daemon 只读。
+- **socket 由 systemd 创建，daemon 不自建、不 chown**（细节与权限表归 [ipc.md](ipc.md) §7）。
+  理由：非 root 的 `actiond` 不可能 `chown` 成 `root:video`（实测 EPERM）。
+- **`actiond.service` 不设 `RuntimeDirectory=`**：那会把已存在的 `/run/tspi-cam` 递归 chown 成
+  `tspi-cam:tspi-cam`，破坏 socket 的 `root:video` 契约，stop 时还会删掉 socket 目录项。
+  目录由 `tmpfiles.d/tspi-cam.conf` 建（`d /run/tspi-cam 0775 root video -`）。
+- **组**：安装器执行 `usermod -aG video k` 且 `usermod -aG input k`（后者只为 Xorg 打开
+  `/dev/input/event*`；`uid` 读 X11 事件，不需要 `input`），`k` 必须重新登录。`actiond` 用
+  `SupplementaryGroups=video`。
+- **Xorg 运行身份**：`xorg.service` 以 **root + `-ac`** 启动（`Xorg :0 -ac -nolisten tcp vt7`），
+  这是 demo 的信任边界：本机可信、X socket 不暴露网络。`uid.service` 因此不需要
+  `XAUTHORITY`。以 `k` 启动 Xorg 需要 logind seat + tty 权限，**在本镜像上未验证**（`UNVERIFIED`，
+  见 ui.md 的验收项），不在文档里假装可行。
+- `actioncal` 以 `tspi-cam` 身份运行（`sudo -u tspi-cam actioncal …` 或安装一个同名 wrapper），
+  这样它能写 `/var/lib/tspi-cam/calibration.json`；与 `actiond` 抢同一把 `device.lock`。
+- `spidev3.0` 开机不存在（H5），节点由镜像里的 `spidev-bind.service` 创建；`actiond.service`
+  用 `After=` + `Wants=`（失败不阻塞，`record.status` 报 `E_HW` 缺 IMU）。设备节点授权规则归
+  deploy.md 的 udev 清单。
 
 ## 4. 预览路径（与录制彻底隔离）
 

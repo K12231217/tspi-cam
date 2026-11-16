@@ -73,7 +73,7 @@ pub struct Response {
 ```
 
 ```json
-{"jsonrpc":"2.0","id":5,"method":"record.subscribe","params":null}
+{"jsonrpc":"2.0","id":5,"method":"record.subscribe"}
 ```
 
 订阅与预览的 ack（ack 之后才开始推送通知）：
@@ -93,7 +93,7 @@ pub struct Response {
 通知（服务 → 客户端，无 `id`）：
 
 ```json
-{"jsonrpc":"2.0","method":"record.progress","params":{"rec_id":"20261116-141230-3f2a","elapsed_ms":15320,"frames":459,"imu_samples":3080,"dropped":0}}
+{"jsonrpc":"2.0","method":"record.progress","params":{"rec_id":"20261116-141230-3f2a","elapsed_ms":15320,"frames":459,"imu_samples":3080,"dropped":{"gap_frames":0,"queue_dropped":0}}}
 ```
 
 ```json
@@ -110,7 +110,7 @@ pub struct Response {
 `skip_serializing_if` 不输出）：
 
 ```json
-{"jsonrpc":"2.0","id":2,"error":{"code":1001,"message":"already recording","data":{"class":"E_STATE"}}}
+{"jsonrpc":"2.0","id":2,"error":{"code":1001,"message":"already recording","data":{"class":"E_STATE","reason":"already_recording"}}}
 ```
 
 `media.frame` 的头部（二进制负载紧随其后，长度由 `payload_len` 给出）：
@@ -180,13 +180,13 @@ impl Request {
 | 线上名 | params | result | lane |
 |---|---|---|---|
 | `hello` | `{api_version:u32, client:String}` | `{api_version, server, build, pid}` | `Prompt` |
-| `record.status` | — | `{state, rec_id?, elapsed_ms, frames, imu_samples, dropped, disk_free_mb, camera:{width,height,fps}, encode:{codec,bitrate_kbps}, last_error?}` | `Prompt` |
+| `record.status` | — | `{state, rec_id?, elapsed_ms, frames, imu_samples, dropped:{gap_frames,queue_dropped}, disk_free_mb, camera:{width,height,fps}, encode:{codec,bitrate_kbps}, last_error?}` | `Prompt` |
 | `record.start` | `{encode:{width,height}, codec:"h264"\|"h265", bitrate_kbps:u32, note?:String}` | `{rec_id, state}` | `Operation` |
 | `record.stop` | `{reason:String}` | `IndexSummary`（见 record-format.md） | `Operation` |
 | `record.list` | `{limit:u16, before?:RecId}` | `{records:[IndexSummary], next?:RecId}` | `Slow` |
 | `record.get` | `RecId` | `IndexSummary` | `Slow` |
 | `record.delete` | `{rec_id:RecId, confirm:bool}` | `{deleted_bytes:u64}` | `Operation` |
-| `record.subscribe` | `null` | `{subscribed:true}`（ack 之后才开始推送通知；连接关闭即退订） | `Stream` |
+| `record.subscribe` | — | `{subscribed:true}`（ack 之后才开始推送通知；连接关闭即退订） | `Stream` |
 | `device.info` | — | `{sensor:{w,h,fps,mode:String}, encoders:{h264_fps_1080p,…}, imu:{who_am_i,odr_hz}, build}` | `Prompt` |
 | `device.config.get` | — | 合并后有效配置（基础层 + 用户层） | `Prompt` |
 | `device.config.set` | `{path:String, value:ConfigValue}`（只写用户层） | `ConfigView`（合并后有效配置） | `Operation` |
@@ -195,11 +195,16 @@ impl Request {
 | `system.log.tail` | `{lines:u16}` | `{lines:[String]}` | `Slow` |
 | `system.shutdown` | `{confirm:bool}` | `{ok:true}`（先停录） | `Operation` |
 | `media.subscribe` | `{max_fps:u8}` | `{subscribed:true,width,height,format}`（仅 `media.sock`） | `Stream` |
-| `media.unsubscribe` | `null` | `{subscribed:false}`（之后不再推帧，连接可复用） | `Prompt` |
+| `media.unsubscribe` | — | `{subscribed:false}`（之后不再推帧，连接可复用） | `Prompt` |
 
 参数类型都定义在 `action-ipc::params`，每个都 `deny_unknown_fields`。
 
 ```rust
+/// 丢帧的两个来源，永远分开报（见 interfaces.md §3.0）。
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dropped { pub gap_frames: u64, pub queue_dropped: u64 }
+
 /// 配置值只允许标量；datetime/数组/表一律不支持（见 §1）。
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
@@ -255,6 +260,9 @@ pub enum Event {
 | `recording` | 正在录，硬件由 `actiond` 持有 | `record.stop`、`record.status`、`record.subscribe` | 第二次 `record.start` → `E_STATE{reason:"already_recording"}`；`device.calibrate.enter` → `E_STATE{reason:"recording"}` |
 | `stopping` | Drain/Flush/Finalize 中 | `record.status`（返回 `stopping` + 进度）、`record.subscribe` | `record.start`/`record.stop` → `E_STATE{reason:"busy_stopping"}` |
 
+- **只读方法在所有状态均可用**：`record.status`、`record.get`、`record.list`、`device.info`、
+  `device.config.get`、`system.log.tail` 不受上表限制；`record.subscribe` 在 `idle` 也可用
+  （UI 启动先订阅再等录制）。"允许的调用"一列只约束**会改变状态**的方法。
 - `E_STATE` 的 `data.reason` 取值固定为 `{already_recording, not_recording, busy_stopping, recording, fault}`，
   客户端按 `reason` 分支，**不解析 `message` 文本**。
 - `fault` 不在 `state` 里：故障表现为"记录未完成"（`index.json.complete=false`）+ `record.event`

@@ -41,6 +41,28 @@ alias）或 `cargo xtask` 内部显式传 `--target`。host 测试与板端验�
 
 ## 2. 契约层（`action-contract`，零依赖）
 
+先定义所有跨模块共用的基础类型（`action-core::types`，`action-contract` 只用不定义语义）：
+
+```rust
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct MonoTime(pub u64);                 // CLOCK_MONOTONIC 纳秒
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TsSource { Sof, Eof, Dequeue }       // MIPI 语义待 H13 核实后固定
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Geometry { pub w: u32, pub h: u32 }
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PixelFormat { Nv12 }
+
+/// 平面视图：`(offset, len)` 指向池映射；不含指针，长度用 stride/vstride 计算。
+#[derive(Copy, Clone, Debug)]
+pub struct FramePlanes { pub luma: (usize, usize), pub chroma: (usize, usize) }
+
+pub const EMPTY_PLANES: FramePlanes = FramePlanes { luma: (0, 0), chroma: (0, 0) };
+```
+
 ```rust
 /// IMU660RB = LSM6DSR 家族，WHO_AM_I(0x0F) 期望 0x6B（器件手册 + 板上实测 H3）
 pub const IMU_WHO_AM_I_REG: u8 = 0x0F;
@@ -53,14 +75,19 @@ pub const SENSOR_W: u32 = 2592;
 pub const SENSOR_H: u32 = 1944;
 pub const SENSOR_FPS: u32 = 30;
 
-/// NV12 平面尺寸（含步幅）。stride 来自 V4L2 `plane_fmt[0].bytesperline`。
-pub const fn nv12_luma_len(stride: u32, h: u32) -> usize { stride as usize * h as usize }
-pub const fn nv12_total(stride: u32, h: u32) -> usize { nv12_luma_len(stride, h) * 3 / 2 }
+/// NV12 尺寸。两个步幅都要显式传：
+///  - `stride`  =  V4L2 `plane_fmt[0].bytesperline`（水平，16 对齐）
+///  - `vstride` = `plane_fmt[0].sizeimage` 反推的垂直步幅（= `sizeimage / (stride*3/2)`），
+///                驱动不做行填充时等于 `h`；本板两种模式实测都等于 `h`。
+pub const fn nv12_luma_len(stride: u32, vstride: u32) -> usize { stride as usize * vstride as usize }
+pub const fn nv12_total(stride: u32, vstride: u32) -> usize { nv12_luma_len(stride, vstride) * 3 / 2 }
 
-// 来源：`v4l2-ctl --get-fmt-video` 在 2592×1944 报 bytesperline=2592、sizeimage=7_558_272（本板实测）
-const _: () = assert!(nv12_total(2592, 1944) == 7_558_272); // 2592*1944*1.5
+// 来源：`v4l2-ctl --get-fmt-video` 实测 —— 2592×1944: bytesperline=2592, sizeimage=7_558_272；
+// 1920×1080: bytesperline=1920, sizeimage=3_110_400。两者都无行填充（vstride == h）。
+const _: () = assert!(nv12_total(2592, 1944) == 7_558_272);
 const _: () = assert!(nv12_total(1920, 1080) == 3_110_400);
 const _: () = assert!(nv12_luma_len(2592, 1944) == 5_038_848);
+// 驱动给 sizeimage 时，采集侧必须断言：sizeimage >= nv12_total(stride, vstride)。
 
 /// MPP 编码器实测上限（H12/H15/H16）；策略分辨率另由配置决定
 pub const ENC_FPS_CEIL_5MP: u32 = 30;      // 2592×1944 实测 30.045 fps
@@ -98,7 +125,8 @@ pub struct FrameLease {
     pub pts: MonoTime,      // = timebase.from_driver(v4l2_buffer.timestamp, src)
     pub geom: Geometry,
     pub format: PixelFormat,
-    pub stride: u32,        // 见 §3.2
+    pub stride: u32,        // 水平步幅，见 §3.2
+    pub vstride: u32,       // 垂直步幅；本板两种模式都等于 h
     planes: FramePlanes,
     buf: BufferIndex,
     pool: Arc<PoolInner>,
@@ -106,6 +134,8 @@ pub struct FrameLease {
 impl FrameLease {
     /// 视图生命周期绑定 `&self`；不存在 `&'static` 版本（否则 lease drop 后仍可读，见 review E3）。
     pub fn planes(&self) -> FramePlanes<'_>;
+    /// dmabuf 导出（v2 优化）：v1 不实现，返回 `None`；有它时编码器可直接拿 fd。
+    pub fn dmabuf(&self) -> Option<std::os::fd::BorrowedFd<'_>>;
 }
 impl Drop for FrameLease {
     /// 槽位 CAS: Leased -> Free，然后 QBUF 一次；失败计入 stats.return_errors，不 panic。
@@ -123,7 +153,16 @@ pub trait FrameSource: Send {
 }
 ```
 
-### 3.0 安全前提与不变式（不写清楚就不能加 `unsafe`）
+### 3.0 内存模型（v1 说清楚，不假装零拷贝）
+
+- **v1 使用 V4L2 `mmap` 缓冲**（与已验证的 gst 路径一致），**不调用 `VIDIOC_EXPBUF`**。
+  因此 `FrameLease` 只提供 CPU 视图；`dmabuf()` 返回 `None`。
+- MPP 编码器接收的是"用户内存 + 步幅"（`mpp_frame_set_buffer` 包装），**不假设硬件直接读这块内存**；
+  因此输入归还时机只按"该帧的 packet 已产出"判定（§4），与内存是否 dmabuf 无关。
+- **v2 才引入零拷贝**：`VIDIOC_EXPBUF` → `mpp_buffer_import`，届时 `dmabuf()` 返回 `Some`，
+  并新增一条验收：同一帧在 dmabuf 与 mmap 两种模式下编码输出必须逐字节一致。
+
+### 3.1 安全前提与不变式（不写清楚就不能加 `unsafe`）
 
 - **`PoolInner: Send + Sync` 是显式承诺**：`base: *mut u8` 等裸指针字段需要 `unsafe impl`，槽位状态用
   `AtomicU8`（`Free → Dequeued → Leased → Free`，CAS 迁移）。用 `Cell<usize>` 记账会丢 5–8% 的更新
@@ -138,7 +177,8 @@ pub trait FrameSource: Send {
   **`queue_depth ≤ 4`（≈133 ms @30 fps）**，不是 8。池里 8 个 buffer 被应用全持有时驱动没有可写
   buffer，采集会被消费者节流——表现为 fps 抖动而不是 `dropped++`，这正是必须留余量的原因。
 - **`dropped` 有两个来源，分开计数**：`gap_frames`（`sequence` 缺口，驱动侧丢）与
-  `queue_dropped`（应用侧溢出）。`record.event` / `index.json` 都分别记录，不允许合并成一个数。
+  `queue_dropped`（应用侧溢出）。`record.status`/`record.progress`/`index.json` 都按
+  `{gap_frames,queue_dropped}` 分别上报，不允许合并成一个数；`record.event` 只报事件本身。
 
 ### 3.1 生命周期与所有权
 
@@ -182,23 +222,30 @@ pub struct EncoderConfig {
     pub bframes: u8,           // 契约要求 0
 }
 
-pub struct EncodedPacket { pub pts: MonoTime, pub keyframe: bool, pub data: Vec<u8> }
+pub struct EncodedPacket { pub frame_id: u64, pub pts: MonoTime, pub keyframe: bool, pub data: Vec<u8> }
 
 pub trait VideoEncoder: Send {
     fn open(cfg: &EncoderConfig) -> Result<Self, EncodeError> where Self: Sized;
     /// 取得输入帧所有权；返回即意味着 lease 归编码器所有，调用方不得再用。
     fn submit(&mut self, frame: FrameLease) -> Result<(), EncodeError>;
-    /// 阻塞至多 timeout；返回 packet 时，FIFO 头部输入已归还（Drop lease）。
+    /// 阻塞至多 timeout；返回 packet 时，**该 packet 的 frame_id 对应输入已归还**（Drop lease）。
+    /// 若某个 id 在流中缺席（编码器跳帧），同样归还它并计 `stats.skipped`，不静默滞留。
     fn poll(&mut self, timeout: Duration) -> Result<Option<EncodedPacket>, EncodeError>;
     fn submit_eos(&mut self) -> Result<(), EncodeError>;
-    fn flush(&mut self) -> Result<(), EncodeError>;
-    fn stats(&self) -> EncoderStats;   // submits, packets, in_flight, lifecycle_errors
+    /// 发 EOS 后按 deadline 把剩余输入逐个 drain 成 packet 并归还；**只有 drain 到最后仍有
+    /// 未归还的输入**才算 `LifecycleMismatch`。不允许"发完 EOS 立刻全部归还"。
+    fn flush(&mut self, deadline: Duration) -> Result<(), EncodeError>;
+    fn stats(&self) -> EncoderStats;   // submits, packets, skipped, in_flight, lifecycle_errors
 }
 ```
 
 - 编码器**只能**通过 `FrameLease` 取得输入；不接受 `&[u8]`，避免绕过池的裸指针。
 - `submit` 后调用方不得访问该帧；想读就用 `stats()` 或自己复制后再提交（不推荐）。
-- 生命周期配对失败计入 `stats.lifecycle_errors` 并触发 `E_ENC_LIFECYCLE`，录制进 `Fault`（§7 旧文档状态机）。
+- **归还按 `frame_id` 匹配**，不按 FIFO 位置：`bframes=0` 时两者等价，但按 id 才允许编码器在
+  码控丢帧时"跳过某个 id"而不把后面的输入永久卡在队列里（跳过的计入 `stats.skipped`）。
+- 只有 `flush(deadline)` drain 完 EOS 仍有残留输入，才算 `LifecycleMismatch`，计入
+  `stats.lifecycle_errors` 并返回 `E_ENC_LIFECYCLE`；此时的录制结果是 `complete=false`，
+  不是"静默丢一帧"。
 
 ## 5. 分辨率契约（sensor / encode / preview 三个几何）
 
@@ -213,8 +260,10 @@ review 指出的缺口：5MP 传感器输入与 1080p 输出之间没有写明�
 - `encode.geom == sensor.geom`：零缩放，直通（5MP 30 fps，实测达标）。
 - 否则插入 **RGA** 缩放（`scale` 模块，硬件 ioctl 同步完成）：capture lease → RGA blit →
   RGA 输出 buffer（第二个池）→ 编码器。RGA 完成即归还 capture lease（同步语义，安全）。
-- **RGA 吞吐尚未实测**（`UNVERIFIED`）：验收条件 = 1080p 缩放 + 编码合计 ≥30 fps、且
-  `v4l2` 不丢帧；达不到就退化为"录制按 sensor.geom、预览单独缩放"。
+- **RGA 吞吐尚未实测**（`UNVERIFIED`）：验收条件是**绝对量**而不是"=30"：1080p 缩放 + 编码
+  持续 `fps_actual ≥ 25` 且 `gap_frames == 0`（目标 30）。之所以不写 30：直通 5MP 实测 30.045，
+  但 1080p 带缩放后的水线比 H12 的 27.0 fps 只高不低，先按 25 设下限，实测出来再收紧。
+  达不到就退化为"录制按 sensor.geom、预览单独缩放"。
 - 预览：从 encoder 前的帧按固定比例抽帧（默认 10 fps）缩小到 480×800；**CPU 缩放实现不允许**
   （会偷走编码预算），用 RGA 或让 MPP 直接出小图。
 - 配置校验（`action-config`）：`encode.geom` 必须在白名单、且 `fps ≤ ceiling`；否则 `E_CFG`。

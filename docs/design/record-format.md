@@ -84,7 +84,7 @@ idle ──record.start──▶ starting ──设备就绪──▶ recording
   │                        └─失败─▶ idle(E_HW/E_CFG)│
   └────finalize ok──────── stopping ◀──record.stop──┘
                               │
-                              └─finalize 失败─▶ 记录 complete=false + record.event(E_IO)
+                              └─finalize 失败─▶ 记录 complete=false + record.event(E_STORAGE)
 ```
 
 - `starting` 不出现在 IPC 的 `state` 里：`record.start` 在 `Operation` lane 内同步等到设备就绪才返回
@@ -92,7 +92,7 @@ idle ──record.start──▶ starting ──设备就绪──▶ recording
 - `stopping` 期间的 `record.status` 返回 `state:"stopping"` + 已写计数；`record.start/stop` 返回
   `E_STATE{reason:"busy_stopping"}`。
 - `record.stop` 返回的 `IndexSummary.complete` 必须是 `true` 才算正常结束；`false` 时
-  `record.event` 同时推送 `E_IO`。
+  `record.event` 同时推送 `E_STORAGE`。
 
 ## 6. 校验（`xtask` 与 PC 端共用）
 
