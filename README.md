@@ -22,7 +22,7 @@
 |---|---|
 | Synchronised recording | Video frames and IMU samples share one monotonic clock, written together for offline stabilisation |
 | SPI IMU sampling | IMU660RB at ~200 Hz; gyroscope + accelerometer, raw values only |
-| MIPI camera capture | OV5695 NV12, encoded to MJPEG via GStreamer `jpegenc` for the demo |
+| MIPI camera capture | OV5695 NV12, encoded to H.264/H.265 by the Rockchip MPP hardware encoder (VEPU2); 1080p30 default, selectable resolutions |
 | Touch UI | Live preview, start/stop recording, recording status |
 | Calibration tool | Camera intrinsics + camera–IMU extrinsics and time offset, stored per device |
 | Storage protection | Recording stops before the disk fills; the system stays alive |
@@ -73,6 +73,8 @@ A Linux PC or WSL2 works too: install `gcc-aarch64-linux-gnu` and run `cargo bui
 
 `tspi-cam` centers on `actiond`: the touch UI and CLI send record requests, the daemon owns the camera, IMU, and storage, and the recorder writes synchronised video + IMU data. Calibration and service management support this record chain.
 
+Design docs (microduck-style, one mechanism per page): [`docs/design/architecture.md`](docs/design/architecture.md) (service split, sockets, state ownership), [`docs/design/ipc.md`](docs/design/ipc.md) (JSON-RPC contract), [`docs/design/interfaces.md`](docs/design/interfaces.md) (crate boundaries and Rust traits).
+
 ### Components and responsibilities
 
 ```mermaid
@@ -109,7 +111,7 @@ The record loop targets **30 fps video and ~200 Hz IMU sampling**. Each frame an
 
 | Record data | Rate (target) | Purpose |
 |---|---|---|
-| Video frames (MJPEG, transcoded from NV12 via `jpegenc`) | 30 fps | The picture |
+| Video frames (H.264/H.265 via MPP hardware encoder, from NV12) | 30 fps | The picture |
 | Gyroscope (3-axis) | ~200 Hz | Rotation for stabilisation |
 | Accelerometer (3-axis) | ~200 Hz | Gravity direction + motion context |
 | Monotonic timestamps | per frame/sample | Align gyro trace to video |
