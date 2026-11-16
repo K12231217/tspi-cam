@@ -1,0 +1,16 @@
+# No `[build] target` here on purpose.
+#
+# A workspace-wide target also retargets host-only work: `xtask`, unit tests for the
+# protocol/state machine/index format, and any future laptop-side helper. Board code is
+# `aarch64-unknown-linux-gnu`; host code is `x86_64-*`. Both must be buildable from this
+# checkout, so the target is chosen per invocation, not pinned here.
+#
+# Board builds:
+#   cargo board            # build --release --target aarch64-unknown-linux-gnu
+#   cargo board-check
+#   cargo board-test
+# or via `cargo xtask`, which passes the target itself.
+[alias]
+board = "build --release --target aarch64-unknown-linux-gnu"
+board-check = "check --target aarch64-unknown-linux-gnu"
+board-test = "test --target aarch64-unknown-linux-gnu"

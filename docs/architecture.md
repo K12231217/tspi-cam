@@ -1,6 +1,9 @@
 # tspi-cam 架构 v1.2
 
-- 状态：v1.2（2026-11-12 23:07），修订 v1.1。
+- 状态：v1.2（2026-11-12 23:07），修订 v1.1。**架构与接口已迁到 `docs/design/`（2026-11-16，
+  对齐 microduck 式服务划分）：系统架构见 `design/architecture.md`，IPC 契约见 `design/ipc.md`，
+  crate/trait 见 `design/interfaces.md`。本文保留为历史设计与 H1–H16 实测记录，两者冲突时以
+  `docs/design/` 为准。**
 - 适用范围：立创泰山派 1M 开发板上的 Rust 视觉惯性数据采集系统，Demo 工程完整性目标。
 - 参考架构：[EasyDuck](https://github.com/jlckfb/easyduck)（同板卡，Daemon + 本地 IPC + 标定交接）。
 - 语言：本文档为中文工作版；公开 README 为英文，两者出现冲突时以本文档为准。
@@ -79,7 +82,7 @@ flowchart TB
     Actiond --> Core["action-core\ncapture / imu / record"]
     Core --> Cam["MIPI OV5695 (NV12)"]
     Core --> IMU["IMU660RB (SPI)"]
-    Core --> Files["/userdata/rec/rec-*/\nvideo.avi + frames.csv\n+ imu.csv + index.json"]
+    Core --> Files["/userdata/rec/rec-*/\nvideo.mkv + frames.csv\n+ imu.csv + index.json"]
     Cal["actioncal"] -->|flock| Lock["/run/tspi-cam/device.lock"]
     Actiond -->|flock| Lock
 ```
@@ -178,9 +181,9 @@ flowchart LR
 ```mermaid
 flowchart TB
     Cap["Camera Capture Thread\nV4L2 read (NV12)"] --> Dist["Frame Distributor"]
-    Dist --> VQ["Bounded Video Queue\ncap 8 frames AND 64 MiB"]
+    Dist --> VQ["Bounded Video Queue\ncap 8 frames (~267 ms)"]
     Dist --> Prev["Preview Slot\nlatest frame only, cap 1"]
-    VQ --> VW["Video Writer Thread\nvideo.avi + frames.csv"]
+    VQ --> VW["Video Writer Thread\nvideo.mkv + frames.csv"]
     IMU["IMU Sampling Thread\nSPI read ~200 Hz"] --> IQ["Bounded IMU Queue\ncap 512 samples"]
     IQ --> IW["IMU Writer Thread\nimu.csv"]
     Prev --> IPC2["Preview socket\nbinary frames, max 10 fps"]
@@ -190,17 +193,19 @@ flowchart TB
 
 | 队列 | 容量 | 满时策略 |
 |---|---|---|
-| Video Queue | **8 帧且 64 MiB，先到为准** | 丢入队帧，`frames_dropped + 1`，继续录 |
+| Video Queue | **8 帧（≈267 ms @30 fps）** | 丢入队帧，`frames_dropped + 1`，继续录 |
 | IMU Queue | 512 样本（约 2.5 s @200 Hz） | 丢入队样本，`imu_dropped + 1`，继续录并标记 |
 | Preview Slot | 1 帧（最新帧覆盖） | 覆盖旧帧，永不阻塞 Capture |
 
-容量选择的依据：
+容量选择的依据（2026-11-16 实测校正）：
 
-- 帧数上限管延迟，字节上限管内存。只用帧数管不住 NV12：MIPI NV12
-  1080p 单帧约 3.0 MiB，8 帧约 24 MiB。同一条“8 帧”规则在不同分辨率下
-  内存占用差数倍，所以必须再加字节上限。
-- 64 MiB 为**工程直觉，未经验证**：8 帧 NV12 1080p（约 24 MiB）留有
-  2 倍以上余量，覆盖突发；板上 2 GB 内存可承受。以 H9 实测为准调整（见 §16）。
+- 队列里放的是**编码前的 NV12 原始帧**，与编码器码率无关：1080p NV12
+  实测 3 110 400 B/帧（60 帧 186 624 000 B），8 帧 = **24.9 MB**。
+- 原“8 帧且 64 MiB”的字节上限在 1080p 下永不触发（64 MiB 可放 20 帧），
+  等于失效，故改为**按时间预算**：8 帧 ≈ 267 ms @30 fps。突发容量的
+  含义是“内存能兜住多久”，用时间表达更准确，换分辨率也不用重算。
+- 24.9 MB 对 2 GB 内存板（实测空闲约 1.5 GB）无压力；分辨率可切换后
+  512 帧上限不变，字节占用随 `camera.width/height` 线性变化。
 
 ### 5.2 隔离与溢出规则
 
@@ -228,7 +233,7 @@ flowchart TB
 
 1. 停止生产：Capture 与 IMU 线程停止入队。
 2. Drain：两个 Writer 线程排空各自队列，直至为空。
-3. Flush + fsync：刷写并同步 `video.avi`、`frames.csv`、`imu.csv`。
+3. Flush + fsync：刷写并同步 `video.mkv`、`frames.csv`、`imu.csv`。
 4. Finalize：写 `index.json`（临时文件 + 原子重命名，见 §8），标记
    `"complete": true`，释放设备，回到 Idle。
 
@@ -281,6 +286,11 @@ flowchart TB
 
 - M1 采用定时轮询（`imu.rate_hz = 200`）。必须统计实际采样间隔与抖动
   （均值、标准差、最大间隔），写入 `index.json`。
+- **ODR 必须显式配置**：LSM6DSR 没有 200 Hz 档，最接近的是 208 Hz。配置项为
+  `imu.odr_hz = 208`，`index.json` 同时记录 `odr_hz` 与实测 `imu_rate_actual_hz`，
+  不得把“目标 200 Hz”当成硬件 ODR 写进元数据。
+- **必须逐字节读**：该板实测多字节自增读返回错误数据（§16 H6），SPI 传输
+  实现禁止使用批量 transfer，只能单字节读累加；这条是实现约束，不是优化项。
 - IMU 支持 DRDY 时，预留基于 Data Ready 的采样机制（M2）：INT 引脚触发
   或高速轮询 DRDY 状态位，时间戳取 `t_drdy`。M1 不实现 DRDY，但
   `imu.rs` 的采样接口不得把“轮询”写死，须保留 `SampleSource::{Poll, Drdy}`。
@@ -362,7 +372,7 @@ stateDiagram-v2
 
 ```text
 rec-20261112-223000/
-├── video.avi        # MJPEG（NV12 经 jpegenc 转码，M1）；H.264（M3）
+├── video.mkv        # H.264 / H.265（NV12 经 MPP 硬件编码）
 ├── frames.csv       # frame_id,t_mono_ns
 ├── imu.csv          # t_mono_ns,gx,gy,gz,ax,ay,az  (rad/s, m/s²)
 └── index.json       # 最终元数据，见下
@@ -510,10 +520,28 @@ pub trait CaptureAdapter {
 
 ### 10.3 NV12 处理路径（M1）
 
-MIPI OV5695 出 NV12，路径为：NV12 →（GStreamer `jpegenc`，先行方案）
-→ MJPEG → 复用现有 Recorder；后续再接 MPP H.264 硬编（M3）。`capture.rs`
-的 Adapter 接口须覆盖 NV12，Recorder 按 `PixelFormat` 分发，不得把 MJPEG
-写死进 Recorder。
+MIPI OV5695 出 NV12，路径为：NV12 →（瑞芯微 MPP 硬件编码，VEPU2）→
+H.264 或 H.265 → Recorder。2026-11-16 板上实测依据：内核 `mpp_vepu2
+fdee0000.vepu: probe device` 完成；`librockchip_mpp` 1.5.0 +
+`/usr/include/rockchip/rk_mpi.h` 存在、`mpp_enc_*` 符号齐全。
+
+软件 MJPEG 实测（ffmpeg 4 线程）1080p 仅 **12.0 fps**、720p **24.6 fps**，
+达不到 30 fps，因此 MJPEG **只作降级兜底**，不作主路径。
+
+编码参数（2026-11-16 决策）：默认 **1080p30**，`camera.codec` 可选
+`h264` / `h265`，分辨率可选（见 §12）。`capture.rs` 的 Adapter 接口须覆盖
+NV12，Recorder 按编码器抽象分发，不得把单一编码器写死进 Recorder。
+
+> 原型期用 GStreamer 验证时注意（H16）：`v4l2src ! mpph264enc ! h264parse !
+> matroskamux ! filesink` 若**不插 `queue`**，各 element 同一线程串联，5MP
+> 只能跑到 20.5 fps；在 `mpph264enc`/`h264parse` 之间插 `queue` 后为
+> 30.045 fps（std 0.45 ms，0 间隙）。M1 自建管线本来就是多线程，不受此限，
+> 但原型脚本与压测必须带 `queue`，否则结论会错一个数量级。
+>
+> 另一处已知噪声：本板 `mpph264enc` 每帧尝试一次 RGA 步幅对齐（`RGA_BLIT
+> fail: 无效的参数`，identity 变换 2592x1944→2592x1952/stride 2560）后走
+> 回退路径；不影响帧率与画质，但会产生逐帧内核日志与额外 CPU，M1 直连 MPP
+> 时应按 16 对齐步幅传帧以绕开该路径。
 
 ### 10.4 V4L2 Buffer 生命周期
 
@@ -553,15 +581,17 @@ Daemon；重启后 Daemon 重新开硬件并读入新标定。
 | Key | 默认 | 说明 |
 |---|---|---|
 | `camera.device` | `/dev/video0` | V4L2 设备（MIPI 节点，待 H8 确认） |
-| `camera.width` / `height` / `fps` | `1920` / `1080` / `30` | 采集格式（目标值，待 H8 验证） |
+| `camera.width` / `height` / `fps` | `1920` / `1080` / `30` | 采集格式。可选档位：`1920x1080`（默认）/ `1280x720` / `960x540` / `480x800`（面板原生，竖屏调试用） |
+| `camera.codec` | `h264` | `h264` 或 `h265`；MPP 硬件编码（VEPU2），见 §10.3 |
+| `camera.bitrate_kbps` | `10000` | 目标码率；1080p30 H.264 建议 8–12 Mbps，H.265 可减半 |
+| `imu.odr_hz` | `208` | 硬件 ODR（LSM6DSR 无 200 Hz 档，取最近档位，见 §6.3） |
 | `imu.device` | `/dev/spidev3.0` | SPI 设备 |
 | `imu.rate_hz` | `200` | 采样率目标 |
 | `imu.max_consecutive_dropped` | `50` | 连续丢样上限，超限停录（§5.2） |
 | `imu.max_dropped_per_10s` | `100` | 任意 10 s 窗口内累计丢样上限，超限停录（§5.2） |
 | `record.dir` | `/userdata/rec` | 录制根目录（不得为 `/`） |
 | `record.storage_headroom_mb` | `500` | 低于此空闲空间即停录 |
-| `record.video_queue_max_frames` | `8` | Video 队列帧数上限 |
-| `record.video_queue_max_bytes_mb` | `64` | Video 队列字节上限（工程直觉，未验证） |
+| `record.video_queue_max_frames` | `8` | Video 队列帧数上限（≈267 ms @30 fps，见 §5.1） |
 | `preview.max_fps` | `10` | 预览帧率上限 |
 | `ipc.control_socket` | `/run/tspi-cam/control.sock` | 控制面 socket |
 | `ipc.preview_socket` | `/run/tspi-cam/preview.sock` | 数据面 socket |
@@ -637,13 +667,13 @@ Daemon；重启后 Daemon 重新开硬件并读入新标定。
 | 功能 | 说明 |
 |---|---|
 | MIPI NV12 采集 | OV5695，`CaptureAdapter` + `mipi_nv12` |
-| NV12 编码路径 | GStreamer `jpegenc` → MJPEG → Recorder |
+| NV12 编码路径 | MPP 硬件编码（VEPU2）→ H.264/H.265 → Recorder；默认 1080p30，`codec` 可选 |
 | Camera 抽象接口 | `Frame` / `PixelFormat` / `CaptureAdapter` |
 | SPI IMU 采集 | 轮询 200 Hz 目标，抖动统计 |
 | 统一时间戳 | `CLOCK_MONOTONIC`，V4L2 时钟域与语义核查（H2） |
-| 有界队列 | Video 8 帧且 64 MiB / IMU 512 样本，溢出计数 |
+| 有界队列 | Video 8 帧（≈267 ms @30 fps，24.9 MB @1080p NV12）/ IMU 512 样本，溢出计数 |
 | 独立 Writer | Video / IMU 各自线程与文件 |
-| Video + Frames + IMU 文件记录 | `video.avi` + `frames.csv` + `imu.csv` + `index.json` |
+| Video + Frames + IMU 文件记录 | `video.mkv` + `frames.csv` + `imu.csv` + `index.json` |
 | Daemon 状态机 | 5 态（§7） |
 | Unix Socket 控制 | 控制面 NDJSON |
 | CLI 控制 | `actionctl` status/start/stop |
@@ -652,7 +682,8 @@ Daemon；重启后 Daemon 重新开硬件并读入新标定。
 
 ### M2：工程化完善
 
-- egui Touch UI。
+- egui Touch UI：Xorg + libmali EGL + `eframe`/`egui_glow`（不走 GLX、不走 Vulkan）；
+  决策与实测见 `docs/research/ui-stack-decision.md`，仓库调研见 `docs/research/ui-frameworks-35.md`。
 - 独立预览数据通道（二进制协议，§9.2）。
 - 完整运行指标（§13.4）。
 - 设备异常处理（§7.2 全覆盖）。
@@ -663,7 +694,7 @@ Daemon；重启后 Daemon 重新开硬件并读入新标定。
 
 ### M3：系统扩展
 
-- MPP H.264 硬编（接替 `jpegenc`）。
+- H.265 码控与画质调优（H.264/H.265 硬件编码已在 M1 接入）。
 - Camera–IMU 外参标定。
 - Camera–IMU 时间偏移标定。
 - Gyroflow 数据格式适配（PC 端导出器）。
@@ -682,7 +713,7 @@ M1 分 A/B 两段。OV5695 模块未到货，M1 不整体阻塞：A 段不依赖
 2. `action-config`：读 `actiond.toml` 并校验。
 3. `action-core` IMU：spidev 打开/配置/读取循环，独立验证采样率与抖动。
 4. 有界队列 + Frame Distributor + Latest Frame 预览槽（用模拟帧源验证）。
-5. 独立 Video / IMU Writer + `video.avi` / `frames.csv` / `imu.csv` 写盘
+5. 独立 Video / IMU Writer + `video.mkv` / `frames.csv` / `imu.csv` 写盘
    （模拟帧源）；`Frame` / `PixelFormat` / `CaptureAdapter` 在此步就绪。
 6. `actiond`：`manager.rs` 生命周期 + 5 态状态机 + `flock()` + 存储保护。
 7. IPC 控制面 + `actionctl`（status/start/stop）。
@@ -693,7 +724,7 @@ M1 分 A/B 两段。OV5695 模块未到货，M1 不整体阻塞：A 段不依赖
 
 10. MIPI 带入：确认节点与驱动，NV12 试采（H8）。
 11. V4L2 时间戳时钟域与语义核查（H2：SOF / EOF / Dequeue）。
-12. NV12 → `jpegenc` → MJPEG → Recorder 接通，`video.avi` 出片。
+12. NV12 → MPP 硬件编码（H.264/H.265）→ Recorder 接通，`video.mkv` 出片（1080p30）。
 13. 端到端联调：板上录制 → 拉回 PC → 核对时间戳、计数与文件完整性。
 
 ## 16. 硬件验证清单（TODO: Hardware Verification）
@@ -710,7 +741,14 @@ M1 分 A/B 两段。OV5695 模块未到货，M1 不整体阻塞：A 段不依赖
 | H6 | SPI 最高可用速率与误码 | 1 MHz / 5 MHz 下连续读取测试 | `imu.rate_hz` 上限 | ✅ 已验证 2026-11-13：1 MHz（60 s，200.0 Hz，抖动 0.10 ms）与 5 MHz（20 s，200.0 Hz，抖动 0.06 ms）下 200 Hz 轮询均零丢样；5 MHz 可用。**另：多字节自增读在该板上返回错误数据**（2026-11-13 块读与单读对照确认：单读数据全对——温度 21.5°C、陀螺零点几度/秒、|加速度| 0.98g），IMU 驱动须逐字节单读；5 MHz 单读已验证（10 s，200.0 Hz，抖动 0.07 ms，数据正确，零偏与 1 MHz 一致） |
 | H7 | eMMC 持续写速度（MJPEG 1080p30 码率下） | 板上写盘测试 | 队列容量与存储保护阈值 | ✅ 已验证 2026-11-13：`/userdata` 上 `dd` 200 MiB + fsync = 37.0 MB/s，远高于 MJPEG 1080p30 所需（约 5–10 MB/s），写盘不是瓶颈 |
 | H8 | OV5695 到货后：MIPI 节点、驱动、NV12 输出 | `v4l2-ctl` + 试采 | **M1 B 段的门** |
-| H9 | 实际帧大小与队列内存占用（NV12 1080p） | 板上录制实测，核对 64 MiB 上限 | §5.1 队列字节上限（现为工程直觉，未验证） |
+| H9 | 实际帧大小与队列内存占用（NV12 1080p） | 板上录制实测，核对队列上限 | §5.1 队列容量 | ✅ 已验证 2026-11-16：`v4l2-ctl --stream-count=60` 得 186 624 000 B = 60 × **3 110 400 B**（1080p NV12 3.11 MB/帧）；8 帧 = 24.9 MB。原 64 MiB 字节上限在 1080p 下永不触发，已改为按时间预算（≈267 ms） |
+| H10 | 无 X 时 libmali 能否用 GBM 平台初始化 EGL | ctypes 调 `gbm_create_device` + `eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR)` | UI 是否需要 Xorg | ✅ 已验证 2026-11-16：`gbm_create_device(/dev/dri/card0)` 成功，但 `eglGetPlatformDisplayEXT` 返回 NULL → 装的是 `libmali-bifrost-g52-g2p0-**x11**` 变体，**GBM/headless 平台不可用** |
+| H11 | Xorg 下 GLES 版本与开销 | 起 `Xorg :0 -ac` 后用 EGL/GLES 探测 | UI 技术栈选型 | ✅ 已验证 2026-11-16：EGL 1.4 (ARM) + **GLES 3.2 `Mali-G52`**（`g2p0-01eac0`），480×800 绑定 CRTC 85；Xorg 常驻 RSS **94 MB**，启动 < 2 s |
+| H12 | MPP 硬件编码能力（H.264/H.265） | 内核 probe + 库/头/符号 + 1080p 实测 | §10.3 编码路径 | ✅ 已验证 2026-11-16：`mpp_vepu2 fdee0000.vepu` probe 完成；`librockchip_mpp` 1.5.0 + `rk_mpi.h` + `mpp_enc_*` 齐全。**`sudo gst-inspect-1.0 rockchipmpp` 可见 `mpph264enc/mpph265enc/mppvp8enc/mppjpegenc`**（非 root 看不到，因 `/dev/mpp_service` 是 `root:video 0660`）。吞吐：纯编码 1080p H.264 **36 fps**、H.265 **36 fps**；相机→H.264 1080p 持续 **27.0 fps**（300 帧/11.13 s）、120 帧 23.6 fps；`matroskamux` 写出的 MKV 经 `ffprobe` 为 `h264 1920x1080 30/1`，抽帧可解码（sensor 彩条）。`io-mode=3` 失败、`io-mode=4`/默认可用 |
+| H13 | rkisp 的 `v4l2_buffer.timestamp` 语义（MIPI） | 自写 v4l 程序对比 `t_drv / CLOCK_MONOTONIC / t_read` | §6.2 时间戳方案（B 段第一步） | `UNVERIFIED`：`v4l2-ctl --verbose` 不打印该字段；H2 的结论只覆盖 USB/UVC |
+| H14 | 相机实际帧率上限（当前驱动配置） | `v4l2-ctl --stream-mmap --stream-count=120` 在四种分辨率下测 | 帧率目标可达性 | ✅ 已验证 2026-11-16：640x480 / 1280x720 / 1920x1080 / 2592x1944 **全部 27–28 fps**；`media-ctl` 显示 sensor 只有一种模式 `SBGGR10_1X10/2592x1944@10000/300000`（30 fps），`VIDIOC_S_PARM` 不支持（`Inappropriate ioctl`）→ 换分辨率不提高帧率 |
+| H15 | MPP 编码吞吐随分辨率缩放 | `videotestsrc num-buffers=300 ! mpph264enc ! fakesink sync=false` | 高帧率编码可行性 | ✅ 已验证 2026-11-16：1920x1080 **36 fps** / 1280x720 **81 fps** / 1296x972 **59 fps** / 640x480 **201 fps**。即：80 fps 只能在 ≤720p 分辨率下编码 |
+| H16 | 最高分辨率 30 fps 压测（2592×1944 H.264 → MKV） | 3600 帧连续录制 + PTS 间隔统计 + 资源采样 | M1 录制稳定性与队列参数 | ✅ 已验证 2026-11-16：3600 帧 / 119.79 s = **30.045 fps**；帧间隔 33.00–34.00 ms，**std 0.45 ms，0 个 >40 ms 间隙**；wall 120.94 s；文件 481.8 MB（≈4.0 MB/s，32 Mbps）；温度 42.5→**49.4 °C 平台**，无降频；内存稳定 515 MB；load 0.55→2.3。**前提：流水线必须用 `queue` 分线程**——不插 `queue` 时同管线只有 **20.5 fps**（401/899 个 >50 ms 间隙），瓶颈是 gst 单线程串联（`h264parse` 单级就吃掉 7 fps：28→21） |
 
 ## 17. 未解决问题
 
@@ -719,5 +757,9 @@ M1 分 A/B 两段。OV5695 模块未到货，M1 不整体阻塞：A 段不依赖
    不得先假定。
 3. V4L2 驱动时间戳时钟域与语义（H2）：结果决定 §6.2 采用直取、EOF 修正、
    偏差补偿还是降级用 `t_read`。
-4. `video.avi` 的 MJPEG 封装细节（AVI muxer 选型）待 M1 第 5 步确定。
-5. Video 队列 64 MiB 上限为工程直觉，待 H9 实测调整。
+4. 录制容器：已定 `video.mkv`（H.264/H.265），MKV 写入选型（gst matroskamux 与
+   直接写 mkv 容器的取舍、崩溃后可读性）待 M1 第 5 步确定；Gyroflow 对 MKV 的
+   支持需在其格式文档中核对。
+5. MPP 编码封装：直接调 `rk_mpi.h` C API（FFI）还是等待可用的 gst 编码插件，
+   待 H12 实测与调研结论（见 `docs/research/mpp-hw-encode.md`）。
+6. Video 队列容量已按时间预算定（8 帧 ≈ 267 ms），不再使用 64 MiB 字节上限（H9 结案）。
