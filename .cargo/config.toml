@@ -1,0 +1,4 @@
+# The only real target is the Taishan Pi (RK3566, aarch64 Linux).
+# Host builds only compile build scripts/proc-macros; product binaries are aarch64.
+[build]
+target = "aarch64-unknown-linux-gnu"
