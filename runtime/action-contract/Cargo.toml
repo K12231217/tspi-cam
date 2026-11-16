@@ -1,0 +1,15 @@
+[package]
+name = "action-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# Zero dependencies on purpose: this crate holds device facts (sensor modes,
+# NV12/stride formulas, encoder limits, IMU registers). `cargo xtask arch`
+# fails the build if anything is added here.
+[dependencies]
+
+[lints]
+workspace = true

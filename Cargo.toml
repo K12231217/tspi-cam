@@ -7,8 +7,10 @@ members = [
     "runtime/action-core",
     "runtime/action-ipc",
     "runtime/action-config",
+    "runtime/action-contract",
     "runtime/action-vqf",
     "calibration/actioncal",
+    "tools/xtask",
 ]
 
 [workspace.package]
@@ -22,12 +24,19 @@ repository = "https://github.com/K12231217/tspi-cam"
 action-core = { path = "runtime/action-core" }
 action-ipc = { path = "runtime/action-ipc" }
 action-config = { path = "runtime/action-config" }
+action-contract = { path = "runtime/action-contract" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
 toml = "0.8"
 thiserror = "2"
 log = "0.4"
 env_logger = "0.11"
+
+[workspace.lints.cargo]
+# The dependency table in docs/design/interfaces.md §1 is the reviewed graph;
+# a dependency may land before the code that uses it (scaffold-before-review).
+unused_dependencies = "allow"
 
 [profile.release]
 opt-level = 2

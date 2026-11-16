@@ -3,6 +3,8 @@ name = "actiond"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "actiond"
@@ -14,3 +16,6 @@ action-ipc.workspace = true
 action-config.workspace = true
 env_logger.workspace = true
 log.workspace = true
+
+[lints]
+workspace = true

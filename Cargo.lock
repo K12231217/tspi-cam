@@ -12,12 +12,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "action-contract"
+version = "0.1.0"
+
+[[package]]
 name = "action-core"
 version = "0.1.0"
 dependencies = [
- "action-config",
+ "action-contract",
+ "action-ipc",
  "action-vqf",
- "log",
  "serde",
  "thiserror",
 ]
@@ -26,9 +30,9 @@ dependencies = [
 name = "action-ipc"
 version = "0.1.0"
 dependencies = [
+ "semver",
  "serde",
  "serde_json",
- "thiserror",
 ]
 
 [[package]]
@@ -44,8 +48,8 @@ name = "actioncal"
 version = "0.1.0"
 dependencies = [
  "action-config",
+ "action-contract",
  "action-core",
- "action-ipc",
 ]
 
 [[package]]
@@ -317,6 +321,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -493,6 +503,10 @@ checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
 
 [[package]]
 name = "zmij"

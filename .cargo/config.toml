@@ -14,3 +14,4 @@
 board = "build --release --target aarch64-unknown-linux-gnu"
 board-check = "check --target aarch64-unknown-linux-gnu"
 board-test = "test --target aarch64-unknown-linux-gnu"
+xtask = "run --package xtask --"
