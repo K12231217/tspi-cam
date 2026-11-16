@@ -11,29 +11,30 @@
 **两个守护进程 + 一个 CLI + 一个离线标定工具**，全部通过 Unix socket 讲同一份 JSON-RPC。
 
 ```text
-   touchscreen ── evdev ──▶ uid ──┐                      (画面)
-        ▲                          │  record.*            │ Xorg + libmali EGL + egui
-        └──── HDMI/DRM ────────────┘  media.frame         ▼
-                                 ┌───────────────────────────────┐
-  你，在笔记本 or CLion ─▶ actionctl ─▶│ 每服务一个 socket · JSON-RPC 2.0 · 一行一个对象 │
-                                 └───────┬───────────────┬───────┘
-                                         ▼               ▼
-                                  ┌────────────┐   ┌──────────────┐
-                                  │  actiond   │   │  actioncal   │
-                                  │ record.*   │   │ 独占设备时用  │
-                                  │ 状态机      │   │ (CLI, flock) │
-                                  │ 硬件唯一持有 │   └──────────────┘
-                                  └──┬──┬──┬───┘
-                    ┌────────────────┘  │  └──────────────┐
-                    ▼                   ▼                 ▼
-              /dev/video0          /dev/spidev3.0    /userdata/rec/
-              (rkisp NV12)        (IMU660RB)         (video.mkv + csv + index.json)
+  touchscreen ── USB HID ──▶ xorg(:0, user k) ── X11 pointer/XI2 ──▶ uid ──┐
+        ▲                          │  (libinput 独占 evdev)                  │ record.*
+        └──── HDMI/DRM ────────────┘  画面：libmali EGL + egui              │ media.frame
+                                 ┌───────────────────────────────────┐      │
+  你，在笔记本 or CLion ─▶ actionctl ─▶│ 每服务一个 socket · JSON-RPC 2.0 · NDJSON │◀──┘
+                                 └──────┬────────────────┬───────────┘
+                                        ▼                ▼
+                                 ┌────────────┐   ┌──────────────┐
+                                 │  actiond   │   │  actioncal   │
+                                 │ record.*   │   │ 独占设备时用  │
+                                 │ 状态机/唯一 │   │ (CLI, flock) │
+                                 │ 硬件持有者   │   └──────────────┘
+                                 └──┬──┬──┬───┘
+                   ┌───────────────┘  │  └──────────────┐
+                   ▼                  ▼                 ▼
+             /dev/video0        /dev/spidev3.0    /userdata/rec/
+             (rkisp NV12)       (IMU660RB)        (video.mkv + csv + index.json)
 ```
 
 | 服务 | 拥有 | 监听 | 只连 |
 |---|---|---|---|
 | `actiond` | **相机、IMU、硬件编码器、录制状态机、存储保护**；`record.*` | `/run/tspi-cam/record.sock` | `/dev/video0`、`/dev/spidev3.0`、`/dev/mpp_service`、`/userdata` |
-| `uid` | 显示与触摸（HDMI 输出、evdev 触摸），**不碰任何采集设备** | 不监听（纯客户端） | `actiond`（`record.*` + `media.frame`） |
+| `xorg` | **显示与输入**：HDMI 480×800@60、libinput 独占触摸 evdev；以操作员账号 `k` 运行 | `:0`（X socket） | `/dev/dri/card0`、`/dev/input/event*` |
+| `uid` | UI 进程：X11 客户端 + egui + libmali EGL；**不读 evdev、不碰采集设备** | 不监听（纯客户端） | `actiond`（`record.*` + `media.frame`）、`xorg`（`DISPLAY=:0`） |
 | `actionctl` | 无 | 无 | `actiond` |
 | `actioncal` | 无（运行时）；离线标定文件 | 无 | `actiond` 的 `device.lock`（flock 互斥），然后独占硬件 |
 
@@ -42,6 +43,10 @@
 
 **`uid` 崩溃不停录。** 它是客户端，重启后重新订阅 `record.status` 即可；`actiond` 从不依赖 `uid`。
 反过来 `uid` 允许依赖 `actiond`（没有 daemon 的 UI 只能显示"服务不可用"）。
+
+**触摸只有一条路径**：`xorg` 经 libinput 独占 `/dev/input/event*`，`uid` 从 X11 拿 pointer/XI2
+事件（实测 Xorg 会 grab 设备，第二个 evdev 读者收不到事件）。`uid` 因此**不需要 `input` 组**，
+需要 `video` 组（连 `actiond` 的 socket）与 `DISPLAY=:0`。
 
 **`actionctl` 必须在 `actiond` 挂掉时仍能工作**：它只讲协议，不加载编码/UI 栈。
 
@@ -53,57 +58,70 @@
 | `/var/lib/tspi-cam/recordd.toml` | **用户层**：只写在这台设备上改过的键；读取时按表 key-by-key 合并覆盖基础层 | `actionctl configure` / `uid` | 升级、回滚都不动 |
 | `/var/lib/tspi-cam/calibration.json` | 每台设备一份：内参、IMU 偏置、外参、时间偏移 | `actioncal` | 不动；`actiond` 启动时读入 |
 | `/var/lib/tspi-cam/device.json` | 设备寿命记录：首次启动、累计录制裁数/时长、错误计数（microduck `vetbook` 同思路） | `actiond` | 不动 |
-| `/run/tspi-cam/record.sock` | 控制/状态 socket，`0660 root:video` | `actiond` | 每次启动重建 |
-| `/run/tspi-cam/media.sock` | 预览帧 socket（二进制帧 + JSON-RPC 头），`0660 root:video` | `actiond` | 每次启动重建 |
+| `/run/tspi-cam/record.sock` | 控制/状态 socket，`0660 root:video` | systemd（`actiond.socket`） | 由 socket unit 管理 |
+| `/run/tspi-cam/media.sock` | 预览帧 socket（二进制帧 + JSON-RPC 头），`0660 root:video` | systemd（`actiond.socket`） | 由 socket unit 管理 |
 | `/run/tspi-cam/device.lock` | `flock` 独占锁：`actiond` 启动即持有，`actioncal` 抢锁 | 两者 | 内核释放，**文件残留不代表被占用** |
 | `/userdata/rec/rec-*/` | 录制产物：`video.mkv`、`frames.csv`、`imu.csv`、`index.json` | `actiond` | 从不进升级包 |
 
-安装布局（microduck 式，可回滚）：
+安装与升级（细节归 [deploy.md](deploy.md)；本节只定所有权）：
 
 ```text
 /opt/tspi-cam/releases/<version>/bin/{actiond,uid,actionctl,actioncal}
-/opt/tspi-cam/current -> releases/<version>        # 原子切换，restart 生效
-/etc/systemd/system/{actiond,uid}.service
-/etc/sysusers.d/tspi-cam.conf                      # 服务账号 tspi-cam，加入 video 组
-/etc/udev/rules.d/70-tspi-cam.rules                # /dev/spidev3.0、video4linux、mpp_service、dri
+/opt/tspi-cam/releases/<version>/systemd/{actiond.service,actiond.socket,uid.service}
+/opt/tspi-cam/current -> releases/<version>
+/etc/systemd/system/{actiond.service,actiond.socket,uid.service}   # 安装器写入，指向 current/bin
+/etc/sysusers.d/tspi-cam.conf     # u tspi-cam；m tspi-cam video
+/etc/udev/rules.d/70-tspi-cam.rules
 ```
 
-**只使用 releases 目录 + `current` 符号链接**，不做"先 `/usr/local/bin` 以后再说"——
-两种布局并存会让"现在跑的是哪一版"变成一个需要猜的问题，而回滚是唯一必须在故障时还能用对的功能。
-`actionctl` 是 `current/bin/actionctl` 的符号链接，升级后立即跟随新版本。
-
-配置与录制数据路径与版本无关：`/etc/tspi-cam`、`/var/lib/tspi-cam`、`/userdata/rec` 不随 releases 移动。
+- **切换原子**：`ln -s releases/<v> current.tmp && mv -T current.tmp current`（同一文件系统上的 rename，
+  没有 unlink 窗口）。保留 `current` + 上一个版本，回滚 = 反向 rename + `systemctl restart`；
+  其余旧版本在健康检查通过后清理。
+- **unit 文件不进 release 的 symlink**：`/etc/systemd/system/*.service` 指向 `current/bin/*`，
+  因此切换版本不需要 `daemon-reload`；若某版本必须改 unit，安装器负责写入并 reload，且这一步
+  不算回滚安全点（写进 deploy.md 的升级检查表）。
+- 配置与录制数据路径与版本无关：`/etc/tspi-cam`、`/var/lib/tspi-cam`、`/userdata/rec` 不随 releases 移动。
 
 ## 3. 启动顺序与权限
 
 ```mermaid
 flowchart LR
-    sys["systemd"] --> ad["actiond.service<br/>After=local-fs,dev-video0?<br/>RuntimeDirectory=tspi-cam"]
-    sys --> ui["uid.service<br/>After=actiond.service<br/>Requires=actiond? 否（弱依赖）"]
-    ad --> sock["/run/tspi-cam/*.sock<br/>chown root:video, 0660"]
-    ui --> sock
+    sock["actiond.socket<br/>SocketMode=0660<br/>SocketGroup=video"]
+    ad["actiond.service<br/>User=tspi-cam<br/>SupplementaryGroups=video<br/>Requires=actiond.socket"]
+    x["xorg.service<br/>User=k · :0"]
+    ui["uid.service<br/>User=k · DISPLAY=:0<br/>After=xorg + actiond (Wants)"]
+    sock --> ad
+    ad --> ui
+    x --> ui
 ```
 
-- `actiond` 以**服务账号**（sysusers 建的 `tspi-cam`）运行，加入 `video` 组；**不使用 root**。
-  设备访问全部由仓库内 `deploy/udev/70-tspi-cam.rules` 授权（当前 `/dev/spidev3.0` 是 `root:root 0600`，
-  这正是必须补的规则）：
+- **socket 由 systemd 创建，daemon 不自建、不 chown**。`actiond.socket` 声明
+  `ListenStream=/run/tspi-cam/record.sock` 与 `.../media.sock`、`SocketMode=0660`、
+  `SocketUser=root`、`SocketGroup=video`；`actiond` 以 `tspi-cam` 身份 `accept` 传入的 fd。
+  理由：非 root 的 `actiond` **不可能** `chown` 成 `root:video`（实测 EPERM），而 `RuntimeDirectory`
+  又保证目录属主是 `tspi-cam`；socket activation 让"属主"和"运行身份"解耦。
+- 客户端 `connect()` 需要 socket 的**写**权限，所以 `0660` 是下限，`0640` 连不上（unix(7)）。
+- **组**：安装器把操作员加入 `video`（`usermod -aG video k`），`k` 需要重新登录才生效；`actiond`
+  通过 `SupplementaryGroups=video` 拿到设备权限。`xorg` 同样以 `k` 运行，需要 `video`（DRM）与
+  `input`（evdev）——`input` 只给 Xorg，`uid` 不需要。
+- 设备访问全部由 `deploy/udev/70-tspi-cam.rules` 授权（当前 `/dev/spidev3.0` 是 `root:root 0600`）：
 
   ```udev
-  # IMU660RB on SPI3
   KERNEL=="spidev3.0", GROUP="video", MODE="0660"
-  # MPP / 显示 / 相机（板级镜像已有 video 组，这里显式固定，防止镜像改动）
   KERNEL=="mpp_service", GROUP="video", MODE="0660"
   SUBSYSTEM=="video4linux", GROUP="video", MODE="0660"
+  KERNEL=="media[0-9]*", SUBSYSTEM=="media", GROUP="video", MODE="0660"
   KERNEL=="card[0-9]", SUBSYSTEM=="drm", GROUP="video", MODE="0660"
   KERNEL=="renderD*", SUBSYSTEM=="drm", GROUP="video", MODE="0660"
+  KERNEL=="rga", GROUP="video", MODE="0660"
   ```
 
-  规则写进仓库、由安装器安装并 `udevadm control --reload && udevadm trigger`；**不靠手工 chmod**
-  （重启即失效，且不可复现）。录制目录 `/userdata/rec` 归 `tspi-cam` 服务账号所有。
-- `uid` 以操作员账号 `k` 运行，通过 socket 组权限访问；它自己需要 `input` 组读触摸（或走 Xorg 的 pointer 事件）。
-- `uid.service` 用 `After=actiond.service` + `Wants=`（不是 `Requires=`）：`actiond` 不在也不阻止 UI 起来报错。
-- `RuntimeDirectory=tspi-cam` 负责 `/run/tspi-cam/` 的创建与清理；**socket 的 `0660` 与组属主写在
-  daemon 里**（bind 后 `fchown`），不靠 umask。
+  `spidev3.0` 开机时不存在（H5：driver_override 不持久），节点由 `spidev-bind.service` 创建后才
+  出现，因此该规则只能对"后出现"的设备生效：`actiond.service` 要 `After=spidev-bind.service`
+  （`Wants=`，失败不阻塞启动，`record.status` 报 `E_HW` 缺 IMU）。
+- `actioncal` 以 `k`（`video` 组）运行，与 `actiond` 抢 `device.lock`；标定期间 `actiond` 释放硬件。
+- **根目录/录制目录**：`/userdata/rec` 归 `tspi-cam`，`/var/lib/tspi-cam` 归 `tspi-cam`；
+  `/etc/tspi-cam` 由安装器写、daemon 只读。
 
 ## 4. 预览路径（与录制彻底隔离）
 

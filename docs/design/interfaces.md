@@ -79,46 +79,66 @@ review 的核心问题：`fn next_frame(&mut self) -> FrameLease<'_>` 表达的�
 因此：
 
 ```rust
-/// 池化的 V4L2 buffer。映射由 Pool 持有（Arc），lease 只带索引与视图。
+/// 池化的 V4L2 buffer。Pool 拥有 fd（内部 dup）与全部 mmap，且必须 Send + Sync。
 pub struct BufferPool { /* Arc<PoolInner> */ }
 
 impl BufferPool {
-    pub fn new(fd: RawFd, count: u32) -> Result<Self, CaptureError>; // REQBUFS + QUERYBUF + mmap
-    pub fn dqbuf(&self, timeout: Duration) -> Result<Option<BufferIndex>, CaptureError>;
-    pub fn lease(&self, idx: BufferIndex) -> FrameLease;   // 状态 Free -> InFlight
-    pub fn available(&self) -> usize;
+    /// fd 所有权归池（内部 dup）：`stop()` 不关 fd，池析构才关。
+    pub fn new(fd: std::os::fd::BorrowedFd<'_>, count: u32) -> Result<Self, CaptureError>;
+    /// 一步完成 DQBUF + 构造租约。pts/id 只在这里有来源，所以不提供两段式 API。
+    pub fn dqbuf(&self, timeout: Duration) -> Result<Option<FrameLease>, CaptureError>;
+    pub fn available(&self) -> usize;          // 原子读；精确值用 stats()
+    pub fn stats(&self) -> PoolStats;          // dequeued, returned, return_errors, gap_frames
+    /// 只做 VIDIOC_STREAMOFF：**不 munmap、不 REQBUFS(0)、不 close**。
+    pub fn stop(&self) -> Result<(), CaptureError>;
 }
 
 pub struct FrameLease {
-    pub id: u64,
-    pub pts: MonoTime,
+    pub id: u64,            // = v4l2_buffer.sequence（驱动帧序号，丢帧缺口由它算）
+    pub pts: MonoTime,      // = timebase.from_driver(v4l2_buffer.timestamp, src)
     pub geom: Geometry,
     pub format: PixelFormat,
-    pub stride: u32,          // 见 §3.2；来自驱动 bytesperline
-    planes: FramePlanes,      // (offset, len) 指向池映射，不含裸指针
+    pub stride: u32,        // 见 §3.2
+    planes: FramePlanes,
     buf: BufferIndex,
     pool: Arc<PoolInner>,
 }
-
-impl Drop for FrameLease {
-    fn drop(&mut self) { self.pool.return_buffer(self.buf); } // QBUF 回驱动
+impl FrameLease {
+    /// 视图生命周期绑定 `&self`；不存在 `&'static` 版本（否则 lease drop 后仍可读，见 review E3）。
+    pub fn planes(&self) -> FramePlanes<'_>;
 }
-unsafe impl Send for FrameLease {} // 保证：池存活期间映射有效；QBUF 只在 Drop 里发生一次
+impl Drop for FrameLease {
+    /// 槽位 CAS: Leased -> Free，然后 QBUF 一次；失败计入 stats.return_errors，不 panic。
+    fn drop(&mut self) { /* … */ }
+}
+unsafe impl Send for FrameLease {}   // 前提：PoolInner: Send + Sync，槽位状态 AtomicU8
+// 同时断言 FrameLease: Send 且 !Sync（static_assertions），因为多线程共享同一 lease 没有意义且危险。
 
 pub trait FrameSource: Send {
     fn start(&mut self, geom: Geometry, fps: u32) -> Result<SourceInfo, CaptureError>;
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<FrameLease>, CaptureError>;
+    /// 只 STREAMOFF；已发出的 lease 仍然可读，munmap 只发生在池析构。
     fn stop(&mut self);
     fn info(&self) -> SourceInfo;
 }
 ```
 
-- **`next_frame` 不再有生命周期参数**，返回的 `FrameLease` 可移动到编码线程。
-- 采集线程每次只持有"当前正在 DQBUF 的那个"引用；队列里放的是已 lease 的帧，**不阻塞下一次
-  `next_frame`**（池容量 8，队列深度 8，满了按 §5 丢帧并计数）。
-- 池的映射归 `BufferPool` 所有；`FrameLease` 只保存索引与 `(offset,len)`。**Drop 顺序由
-  `Arc` 保证**：租约先于池析构（`actiond` 的线程 join 顺序写进 session）。
-- `Send` 是显式 unsafe 承诺，配套测试：`fn assert_send<T: Send>() {}` 静态断言 + 多线程搬运测试。
+### 3.0 安全前提与不变式（不写清楚就不能加 `unsafe`）
+
+- **`PoolInner: Send + Sync` 是显式承诺**：`base: *mut u8` 等裸指针字段需要 `unsafe impl`，槽位状态用
+  `AtomicU8`（`Free → Dequeued → Leased → Free`，CAS 迁移）。用 `Cell<usize>` 记账会丢 5–8% 的更新
+  （review 实验 E2：20 万次并发，期望 1,000,000 次计数，实测 936k–949k），`available()` 与
+  `qbuf_calls` 就永远对不上。
+- **同一 buffer 不可能被租两次**：`FrameLease` 只在 `dqbuf` 内部构造（`lease()` 是私有、且不导出），
+  所以"两次 Drop 两次 QBUF"在类型层面不可达。
+- **`stop()` 不改内存生命周期**：只 STREAMOFF。`munmap` / `REQBUFS(0)` / `close` 只发生在
+  `PoolInner::drop`。`stop()` 之后 `next_frame` 返回 `Err(CaptureError::Stopped)`（不是 `Ok(None)`）；
+  此时已发出的 lease 仍可读，`Drop` 里的 QBUF 允许返回 `ENODEV/EBADF`，计入 `return_errors`。
+- **容量不变式**：`count >= queue_depth + encoder_in_flight_max + 2`。本板 `count=8`，因此
+  **`queue_depth ≤ 4`（≈133 ms @30 fps）**，不是 8。池里 8 个 buffer 被应用全持有时驱动没有可写
+  buffer，采集会被消费者节流——表现为 fps 抖动而不是 `dropped++`，这正是必须留余量的原因。
+- **`dropped` 有两个来源，分开计数**：`gap_frames`（`sequence` 缺口，驱动侧丢）与
+  `queue_dropped`（应用侧溢出）。`record.event` / `index.json` 都分别记录，不允许合并成一个数。
 
 ### 3.1 生命周期与所有权
 
@@ -250,11 +270,24 @@ impl Recorder {
 | `xtask smoke` | 板上：`record.status` → `record.start` 5 s → `record.stop`；核对帧数、`index.json`、退出码 | 把 `record.sock` 指到不存在路径 → `E_IPC` 而非超时 |
 | `xtask size` | 产物大小上限 | — |
 
-## 9. Buffer Pool 的验收测试（host 可跑）
+## 9. Buffer Pool 的验收测试（host 可跑，mock 驱动）
 
-1. **容量**：`count=8`，租约 8 个后 `dqbuf` 返回 `None`（超时），归还 1 个后恢复；
-2. **Drop 即归还**：`lease.drop()` 后 `available()` +1，且 `QBUF` 只发生一次（mock 记录调用次数）；
-3. **跨线程**：`FrameLease: Send` 静态断言 + 生产者/消费者线程搬运 10k 次，无泄漏、无双重归还；
-4. **池先析构**：线程 join 后池 Drop，无 use-after-unmap（用 mock 计数断言）；
-5. **解码/编码配对**：mock 编码器提交 N 帧、吐 N 个 packet，断言 `in_flight == 0`；
-   故意少吐一个 packet，断言 `lifecycle_errors == 1` 且返回 `E_ENC_LIFECYCLE`。
+所有断言都针对**精确计数**，不是"没崩就算过"：
+
+1. **容量与余量**：`count=8, queue_depth=4`；连续 `dqbuf` 8 次全部成功，第 9 次返回 `Ok(None)`（超时）；
+   归还 1 个后恢复。另有一条不变式测试：`assert!(count >= queue_depth + max_in_flight + 2)`。
+2. **Drop 即归还且只还一次**：N=10_000 次 lease/drop 后 `stats.returned == 10_000`、
+   `stats.return_errors == 0`、`qbuf_calls == 10_000`（mock 计数）。用 `Cell` 记账的实现会在此红
+   （review E2：并发下丢 5–8%）。
+3. **跨线程**：`assert_send::<FrameLease>()` + `assert_not_impl_any!(FrameLease: Sync)`
+   （**只断言 Send 没用**：`unsafe impl` 会让它恒过，review E1）；生产者/消费者 10k 次往返，
+   `qbuf_calls == 10_000 && available() == count`。
+4. **`stop()` 不动内存**：持有 1 个 lease 时 `stop()` → `munmap_calls == 0` 且 `planes()` 仍可读；
+   drop lease 后 `returned == 1`；最后 drop 池 → `munmap_calls == 1`。`stop()` 后 `next_frame`
+   必须返回 `Err(CaptureError::Stopped)`，不是 `Ok(None)`。
+5. **fd 归属**：`BufferPool::new` 之后关掉调用方 fd，池仍能 QBUF（内部 dup 生效）；池析构后
+   `close` 恰好一次。
+6. **驱动丢帧计数**：mock 的 `sequence` 跳号（…, 41, 45, …）→ `stats.gap_frames == 3`，且
+   `record.event` 里 `dropped` 的两个来源分别上报（`gap_frames` / `queue_dropped`）。
+7. **编码器配对**：mock 编码器提交 N 帧、吐 N 个 packet，`in_flight == 0`；故意少吐一个 packet →
+   `lifecycle_errors == 1` 且返回 `E_ENC_LIFECYCLE`（不允许静默丢）。
