@@ -1,7 +1,10 @@
 # Board build environment: the target board runs Ubuntu 20.04 / glibc 2.31.
 # Building on a newer host links against a newer glibc (or, with musl, breaks
 # dlopen for librockchip_mpp), so the reproducible build runs here.
-FROM ubuntu:20.04
+# Pull through a mirror when Docker Hub is unreachable (CN networks):
+#   BASE_IMAGE=docker.m.daocloud.io/library/ubuntu:20.04 deploy/container/build.sh
+ARG BASE_IMAGE=ubuntu:20.04
+FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \

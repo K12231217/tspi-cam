@@ -15,7 +15,8 @@ if ! command -v "$RUNTIME" >/dev/null 2>&1; then
     exit 1
 fi
 
-"$RUNTIME" build -q -t "$IMAGE" deploy/container
+BASE_IMAGE=${BASE_IMAGE:-ubuntu:20.04}
+"$RUNTIME" build -q --build-arg BASE_IMAGE="$BASE_IMAGE" -t "$IMAGE" deploy/container
 
 exec "$RUNTIME" run --rm \
     -v "$PWD":/src \
