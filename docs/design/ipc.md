@@ -73,10 +73,11 @@ pub struct Response {
 {"jsonrpc":"2.0","id":2,"result":{"rec_id":"20261116-141230-3f2a","state":"recording"}}
 ```
 
-错误响应：
+错误响应（`result` 不出现——JSON-RPC 2.0 §5：result 与 error 互斥；`Response::result` 为 `None` 时
+`skip_serializing_if` 不输出）：
 
 ```json
-{"jsonrpc":"2.0","id":2,"result":null,"error":{"code":1001,"message":"already recording","data":{"class":"E_STATE"}}}
+{"jsonrpc":"2.0","id":2,"error":{"code":1001,"message":"already recording","data":{"class":"E_STATE"}}}
 ```
 
 `media.frame` 的头部（二进制负载紧随其后，长度由 `payload_len` 给出）：
@@ -112,10 +113,33 @@ pub enum Call {
 }
 ```
 
-单元变体（`RecordStatus`、`DeviceInfo`、`RecordSubscribe`）序列化为 `"params":null`；`RecordGet`/`RecordDelete`
-的参数是裸值（`"20261116-141230-3f2a"`），不做无意义的 `{id:…}` 包裹。
+单元变体（`RecordStatus`、`DeviceInfo`、`RecordSubscribe`）**不带 `params` 字段**，线上就是
+`{"jsonrpc":"2.0","id":4,"method":"record.status"}`（实测：adjacently-tagged 枚举的 unit 变体不输出
+`"params":null`）；`RecordGet`/`RecordDelete` 的参数是裸值（`"params":"20261116-141230-3f2a"`），
+不做无意义的 `{id:…}` 包裹。
 
-### 3.1 方法与参数/结果
+### 3.1 解码必须经过两步（否则错误码无法区分）
+
+**不要直接给 `Request` derive `Deserialize`。** 实测：adjacently-tagged 枚举会把未知方法变成
+`unknown variant \`record.nope\`, expected one of …` 的**解码错误**，这样 `-32601` 与 `-32602` 就分不开，
+也无法在 `data` 里报出方法名/字段名。
+
+`action-ipc` 必须提供：
+
+```rust
+impl Request {
+    /// 1) 先把 `method` 当字符串取出；未知方法 → METHOD_NOT_FOUND { method }
+    /// 2) 再按该变体的 params 类型解码；失败 → INVALID_PARAMS { field }
+    pub fn decode(line: &str) -> Result<Self, RpcError>;
+}
+```
+
+实现上先用 `#[derive(Deserialize)] struct Envelope { jsonrpc, id, method: String, params: Option<Value> }`
+读外壳，再 `match method.as_str()` 到 `Call` 变体并逐个 `serde_json::from_value::<Params>(raw)`。
+**`Call` 的 `Deserialize` 只用于测试与文档夹具，线上路径一律走 `decode`**——这条差异必须写在
+`action-ipc` 的模块注释里，否则实现阶段一定有人直接 `from_str` 然后丢掉错误码。
+
+### 3.2 方法与参数/结果
 
 | 线上名 | params | result | lane |
 |---|---|---|---|
@@ -137,7 +161,7 @@ pub enum Call {
 
 参数类型都定义在 `action-ipc::params`，每个都 `deny_unknown_fields`。
 
-### 3.2 `Event`（通知）
+### 3.3 `Event`（通知）
 
 ```rust
 #[serde(tag = "method", content = "params")]
@@ -149,7 +173,7 @@ pub enum Event {
 
 `record.event.class` 取值与 §6 错误码 `class` 一致。事件不是 `Call`，客户端不能把它当请求回复。
 
-### 3.3 `media.frame` 不是 `Call`
+### 3.4 `media.frame` 不是 `Call`
 
 只在 `/run/tspi-cam/media.sock` 上：先一个 JSON-RPC 响应头（见 §2），紧接着 `payload_len` 字节的
 NV12 平面数据（luma 后 chroma，按 `stride` 排布，见 [interfaces.md](interfaces.md) §3）。
@@ -207,9 +231,13 @@ pub const API_VERSION: u32 = 1;   // 任何不兼容改动 +1
 
 1. **协议示例即测试**：本文所有 ```json 块被抽成夹具，`deserialize→serialize` 必须逐字节等价；
 2. `Call::method()` 与 `#[serde(rename)]` 一一对应，无重复、无孤儿；
-3. 每个 `Call` 变体都有 lane，且与 §3.1 表一致；
+3. 每个 `Call` 变体都有 lane，且与 §3.2 表一致；
 4. 每个 `params` 结构体都有 `deny_unknown_fields`；
-5. 未知方法 → `METHOD_NOT_FOUND`，未知字段 → `INVALID_PARAMS`，各有一个测试；
-6. `API_VERSION` 变更必须同时改 `CHANGELOG` 的 `ipc:` 段。
+5. `Request::decode`：未知方法 → `METHOD_NOT_FOUND`（data 带方法名）、未知字段 → `INVALID_PARAMS`
+   （data 带字段名），各一个测试；
+6. 单元变体（`record.status`）与裸值参数（`record.get`）各一个往返夹具，断言线上**没有**
+   `params` 字段 / `params` 是标量；
+7. 错误响应序列化结果中不出现 `result`；
+8. `API_VERSION` 变更必须同时改 `CHANGELOG` 的 `ipc:` 段。
 
 每条都要有一次"故意让它红"的记录（负向验证），否则不算门禁。
