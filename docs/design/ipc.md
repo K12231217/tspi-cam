@@ -1,128 +1,215 @@
 # tspi-cam IPC 契约
 
-- 状态：v1（2026-11-16）· 拥有者：`runtime/action-ipc`（唯一实现这份契约的 crate）
+- 状态：v2（2026-11-16，按 review 修订）· 拥有者：`runtime/action-ipc`（唯一实现这份契约的 crate）
 - 形态照抄 microduck 的 `duck-ipc-proto`：**JSON-RPC 2.0，一行一个对象（NDJSON），每服务一个 Unix socket**。
 - 该 crate 只依赖 `serde` / `serde_json` / `semver`：所有服务（包括坏掉时还要能用的 `actionctl`）
   都编译它，不允许引入 tokio、http、crypto、图像库。
 
-## 1. 帧格式
+## 1. 报文类型（`action-ipc::wire`）
 
-```text
-→ {"jsonrpc":"2.0","id":1,"method":"record.start","params":{...}}
-← {"jsonrpc":"2.0","method":"record.progress","params":{...}}      ← 通知（无 id）
-← {"jsonrpc":"2.0","id":1,"result":{"rec_id":"20261116-141230-3f2a"}}
+```rust
+#[derive(Serialize, Deserialize)]
+pub struct Request {
+    pub jsonrpc: String,               // 恒为 "2.0"
+    pub id: Id,                        // number 或 string；通知没有 id
+    #[serde(flatten)]
+    pub call: Call,                    // 见 §3，tag="method"、content="params"
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Notification {              // 服务 -> 客户端，无 id
+    pub jsonrpc: String,
+    #[serde(flatten)]
+    pub event: Event,                  // tag="method"、content="params"
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Response {
+    pub jsonrpc: String,
+    pub id: Id,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<RpcError>,
+}
 ```
 
-- 分帧：单个 `\n`。一个连接上请求可并发，靠 `id` 匹配（`id`: number 或 string）。
-- 进度/事件用**通知**（无 `id`）推送，客户端断线重连后重新 `Subscribe` 即可继续收。
-- 参数严格：所有 `params` 结构体 `#[serde(deny_unknown_fields)]`——**多一个字段就报
-  `INVALID_PARAMS` 并指名字段**，这是防止"旧客户端以为改了一个不存在的参数"的唯一机制。
+- 分帧：单个 `\n`。请求可并发，靠 `id` 匹配。
+- 进度/事件用**通知**（无 `id`）推送；客户端断线重连后重新 `record.subscribe` 即可继续收。
+- 所有 `params` 结构体 `#[serde(deny_unknown_fields)]`：多一个字段就是 `INVALID_PARAMS` 并指名字段。
 
-## 2. 唯一契约：`Call` 枚举
+## 2. 精确报文示例（同时是测试夹具）
 
-方法名与参数在类型上成对绑定，**不存在"方法 A + 参数 B"的发送方式**（microduck 同款做法）：
+以下 JSON 块会被 `cargo xtask ipc` 从本文件抽出，与 `action-ipc/tests/wire.rs` 的夹具逐字节比对——
+**文档里的例子就是测试用例**，改文档不改测试会红。
+
+请求：
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"hello","params":{"api_version":1,"client":"actionctl/0.1.0"}}
+```
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"record.start","params":{"encode":{"width":1920,"height":1080},"codec":"h264","bitrate_kbps":10000}}
+```
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"record.stop","params":{"reason":"operator"}}
+```
+
+通知（服务 → 客户端，无 `id`）：
+
+```json
+{"jsonrpc":"2.0","method":"record.progress","params":{"rec_id":"20261116-141230-3f2a","elapsed_ms":15320,"frames":459,"imu_samples":3080,"dropped":0}}
+```
+
+```json
+{"jsonrpc":"2.0","method":"record.event","params":{"rec_id":"20261116-141230-3f2a","class":"E_STORAGE","code":1003,"message":"headroom below 500 MB, stopping"}}
+```
+
+成功响应：
+
+```json
+{"jsonrpc":"2.0","id":2,"result":{"rec_id":"20261116-141230-3f2a","state":"recording"}}
+```
+
+错误响应：
+
+```json
+{"jsonrpc":"2.0","id":2,"result":null,"error":{"code":1001,"message":"already recording","data":{"class":"E_STATE"}}}
+```
+
+`media.frame` 的头部（二进制负载紧随其后，长度由 `payload_len` 给出）：
+
+```json
+{"jsonrpc":"2.0","id":7,"result":{"frame_id":12034,"pts_ns":88123456789,"width":480,"height":800,"format":"nv12","stride":480,"payload_len":576000}}
+```
+
+## 3. `Call`：方法名与参数在类型上成对绑定
+
+**每个变体显式指定线上名**（`#[serde(rename = "...")]`），不依赖 Rust 变体名的大小写规则。
+线上名是**永久契约**：改名 = 破坏性变更，必须 `API_VERSION + 1` 并在 `CHANGELOG` 的 `ipc:` 段写明。
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Call {
-    /// 每条连接的第一个调用。
-    Hello(HelloParams),
-
-    // ── record.* ─────────────────────────────────────────────
-    RecordStatus,                       // 快照：状态、已录时长、帧/样本计数、磁盘余量
-    RecordStart(StartParams),           // 进入 Starting；参数覆盖本次录制（分辨率/码率/编码器）
-    RecordStop(StopParams),             // 走 Drain→Flush→Finalize，返回 IndexSummary
-    RecordList(ListParams),             // 分页列 rec-*
-    RecordGet(RecId),                   // 读 index.json
-    RecordDelete(RecId),                // 删除（需 confirm=true）
-    RecordSubscribe,                    // 之后持续收到 record.progress / record.event
-
-    // ── device.* ─────────────────────────────────────────────
-    DeviceInfo,                         // 相机/IMU/编码器能力 + 实测上限（只读）
-    DeviceConfigGet,                    // 合并后的有效配置（基础层 + 用户层）
-    DeviceConfigSet(ConfigPatch),       // 只写用户层；返回新有效配置
-    DeviceCalibrateEnter,               // 取 device.lock 交给 actioncal；actiond 释放硬件
-    DeviceCalibrateLeave,               // actioncal 结束，actiond 重新取锁开设备
-
-    // ── system.* ─────────────────────────────────────────────
-    SystemLogTail(LogParams),           // 最近 N 行 journald（排障用，不落盘）
-    SystemShutdown(ShutdownParams),     // 停录后关机（confirm=true）
+    #[serde(rename = "hello")]                    Hello(HelloParams),
+    #[serde(rename = "record.status")]            RecordStatus,
+    #[serde(rename = "record.start")]             RecordStart(StartParams),
+    #[serde(rename = "record.stop")]              RecordStop(StopParams),
+    #[serde(rename = "record.list")]              RecordList(ListParams),
+    #[serde(rename = "record.get")]               RecordGet(RecId),
+    #[serde(rename = "record.delete")]            RecordDelete(DeleteParams),
+    #[serde(rename = "record.subscribe")]         RecordSubscribe,
+    #[serde(rename = "device.info")]              DeviceInfo,
+    #[serde(rename = "device.config.get")]        DeviceConfigGet,
+    #[serde(rename = "device.config.set")]        DeviceConfigSet(ConfigPatch),
+    #[serde(rename = "device.calibrate.enter")]   DeviceCalibrateEnter,
+    #[serde(rename = "device.calibrate.leave")]   DeviceCalibrateLeave,
+    #[serde(rename = "system.log.tail")]          SystemLogTail(LogParams),
+    #[serde(rename = "system.shutdown")]          SystemShutdown(ShutdownParams),
 }
 ```
 
-不是 `Call` 的特例（microduck 也这样处理原始帧）：
+单元变体（`RecordStatus`、`DeviceInfo`、`RecordSubscribe`）序列化为 `"params":null`；`RecordGet`/`RecordDelete`
+的参数是裸值（`"20261116-141230-3f2a"`），不做无意义的 `{id:…}` 包裹。
 
-- `media.frame`：只在 `/run/tspi-cam/media.sock` 上，先回 JSON-RPC 头，紧接着是头里声明长度的
-  二进制负载（NV12 平面）。**永不进入控制通道**，也永远不是 `Call`。
-- `record.progress` / `record.event`：只作为通知出现，不是请求。
+### 3.1 方法与参数/结果
 
-## 3. 方法与 lane
-
-每条方法声明一个 lane，`actionctl` 与 `uid` 按 lane 选超时；服务端按 lane 决定是否允许并发。
-
-| lane | 语义 | 超时 | 方法 |
+| 线上名 | params | result | lane |
 |---|---|---|---|
-| `Prompt` | 纯内存查表 | 500 ms | `RecordStatus`、`DeviceInfo`、`DeviceConfigGet` |
-| `Slow` | 读盘/扫目录 | 5 s | `RecordList`、`RecordGet`、`SystemLogTail` |
-| `Operation` | 会改变状态，可能几十秒 | 120 s | `RecordStart`、`RecordStop`、`RecordDelete`、`DeviceConfigSet`、`DeviceCalibrateEnter/Leave`、`SystemShutdown` |
-| `Stream` | 永不返回，写通知直到对端断开 | — | `RecordSubscribe`、`media.frame` |
+| `hello` | `{api_version:u32, client:String}` | `{api_version, server, build, pid}` | `Prompt` |
+| `record.status` | — | `{state, rec_id?, elapsed_ms, frames, imu_samples, dropped, disk_free_mb, camera:{width,height,fps}, encode:{codec,bitrate_kbps}, last_error?}` | `Prompt` |
+| `record.start` | `{encode:{width,height}, codec:"h264"\|"h265", bitrate_kbps:u32, note?:String}` | `{rec_id, state}` | `Operation` |
+| `record.stop` | `{reason:String}` | `IndexSummary`（见 record-format.md） | `Operation` |
+| `record.list` | `{limit:u16, before?:RecId}` | `{records:[IndexSummary], next?:RecId}` | `Slow` |
+| `record.get` | `RecId` | `IndexSummary` | `Slow` |
+| `record.delete` | `{rec_id:RecId, confirm:bool}` | `{deleted_bytes:u64}` | `Operation` |
+| `record.subscribe` | — | 无 result；之后持续收到 `record.progress`/`record.event` | `Stream` |
+| `device.info` | — | `{sensor:{w,h,fps,mode:String}, encoders:{h264_fps_1080p,…}, imu:{who_am_i,odr_hz}, build}` | `Prompt` |
+| `device.config.get` | — | 合并后有效配置（基础层 + 用户层） | `Prompt` |
+| `device.config.set` | `{path:String, value:toml::Value}`（只写用户层） | 新有效配置 | `Operation` |
+| `device.calibrate.enter` | — | `{lock:"held"}`（`actiond` 释放硬件，锁交给 `actioncal`） | `Operation` |
+| `device.calibrate.leave` | — | `{reopened:true}` | `Operation` |
+| `system.log.tail` | `{lines:u16}` | `{lines:[String]}` | `Slow` |
+| `system.shutdown` | `{confirm:bool}` | `{ok:true}`（先停录） | `Operation` |
 
-- `RecordStart` 在 `Starting` 阶段允许被 `RecordStop` 取消；`Stopping` 期间新的 `RecordStart/Stop`
-  返回 `BUSY_STOPPING`。
-- 同一连接上 `Operation` 串行；不同连接之间由 `actiond` 状态机裁决。
+参数类型都定义在 `action-ipc::params`，每个都 `deny_unknown_fields`。
 
-## 4. 版本规则（照抄 microduck 的结论）
+### 3.2 `Event`（通知）
 
 ```rust
-pub const API_VERSION: u32 = 1;             // 任何不兼容改动都 +1
-pub struct HelloParams  { pub api_version: u32, pub client: String }
-pub struct HelloResult  { pub api_version: u32, pub server: String, pub build: String, pub pid: u32 }
+#[serde(tag = "method", content = "params")]
+pub enum Event {
+    #[serde(rename = "record.progress")] RecordProgress(Progress),
+    #[serde(rename = "record.event")]    RecordEvent(RecordEvent),
+}
 ```
 
-- **版本不同不拒绝任何调用。** 只记录、只在 `HelloResult` 里回报。真正会失败的只有两种情况：
+`record.event.class` 取值与 §6 错误码 `class` 一致。事件不是 `Call`，客户端不能把它当请求回复。
+
+### 3.3 `media.frame` 不是 `Call`
+
+只在 `/run/tspi-cam/media.sock` 上：先一个 JSON-RPC 响应头（见 §2），紧接着 `payload_len` 字节的
+NV12 平面数据（luma 后 chroma，按 `stride` 排布，见 [interfaces.md](interfaces.md) §3）。
+它**永不进入控制通道**，也永远不参与 `Call`/`Event` 路由——一帧 1080p 有 3.1 MB，混进控制面会把
+`record.status` 的延迟从微秒级拖到毫秒级。
+
+## 4. 版本规则（microduck 的结论，照抄）
+
+```rust
+pub const API_VERSION: u32 = 1;   // 任何不兼容改动 +1
+```
+
+- **版本不同不拒绝任何调用**，只在 `hello` 的 result 里回报。真正失败的只有两种情况：
   方法不存在（`METHOD_NOT_FOUND`，报方法名）或参数形状变了（`INVALID_PARAMS`，报字段名）。
-- 理由（microduck 实测踩过的坑）：在握手上拒绝会让"能服务的调用"一起失败，包括
-  `update apply` —— 而版本偏差本来就该由那一条调用自己失败。
-- 协议"只会向前兼容不了"：旧 daemon 不会拒绝它一直忽略的字段，所以升版本号仍然必要；
-  所有二进制总是一起发布（安装器保证）。
+- 理由：在握手上拒绝会让本可服务的调用一起失败；所有二进制总是一起发布，安装器保证。
 
-## 5. 错误码
+## 5. lane 与超时
 
-`code` 是稳定的数字，`data.class` 是给 UI 分类的字符串，`message` 给人看。
-
-| 数字 | class | 含义 | 典型来源 |
+| lane | 语义 | 客户端超时 | 服务端并发 |
 |---|---|---|---|
-| -32700 | `PARSE` | 不是合法 JSON | 解码 |
-| -32601 | `METHOD_NOT_FOUND` | 方法不存在（data 里带方法名） | 分发 |
-| -32602 | `INVALID_PARAMS` | 参数不合法（data 里带字段名） | serde 严格模式 |
-| 1001 | `E_STATE` | 非法状态转移（`ALREADY_RECORDING`/`NOT_RECORDING`/`BUSY_STOPPING`） | 状态机 |
-| 1002 | `E_HW` | 设备打不开/丢失/编码器失败 | 采集/编码 |
-| 1003 | `E_STORAGE` | 磁盘余量不足、写盘失败 | 写盘/保护 |
-| 1004 | `E_CFG` | 配置不合法（分辨率不在白名单等） | 配置 |
-| 1005 | `E_IPC` | socket/权限/对端断开 | 传输 |
-| 1006 | `E_CALIB` | 标定文件缺失/损坏/版本不符 | 标定 |
+| `Prompt` | 纯内存查表 | 500 ms | 可并发 |
+| `Slow` | 读盘/扫目录 | 5 s | 可并发 |
+| `Operation` | 改变状态，可能几十秒 | 120 s | 同一连接串行；跨连接由状态机裁决 |
+| `Stream` | 不返回 result，写通知直到断开 | — | 每连接一个 |
 
-错误码随 `record.event` 与 `index.json.errors` 落盘，**不允许只打日志**。
+## 6. 错误码
 
-## 6. Socket 与权限
+| 数字 | class | 含义 |
+|---|---|---|
+| -32700 | `PARSE` | 不是合法 JSON |
+| -32601 | `METHOD_NOT_FOUND` | 方法不存在（data 带方法名） |
+| -32602 | `INVALID_PARAMS` | 参数不合法（data 带字段名） |
+| 1001 | `E_STATE` | 非法状态转移（`ALREADY_RECORDING`/`NOT_RECORDING`/`BUSY_STOPPING`） |
+| 1002 | `E_HW` | 设备打不开/丢失/编码器失败 |
+| 1003 | `E_STORAGE` | 余量不足、写盘失败 |
+| 1004 | `E_CFG` | 配置不合法（分辨率不在白名单等） |
+| 1005 | `E_IPC` | socket/权限/对端断开 |
+| 1006 | `E_CALIB` | 标定文件缺失/损坏/版本不符 |
+| 1007 | `E_ENC_LIFECYCLE` | 编码器输入/输出不配对（见 interfaces.md §4） |
 
-| socket | 模式 | 所有者 | 谁连 |
+错误码随 `record.event` 与 `index.json.errors` 落盘，不允许只打日志。
+
+## 7. Socket 与权限
+
+| socket | 模式 | 组 | 谁连 |
 |---|---|---|---|
-| `/run/tspi-cam/record.sock` | 0660 | `root:video`（`actiond` bind 后 `fchown`） | `uid`、`actionctl` |
-| `/run/tspi-cam/media.sock` | 0660 | `root:video` | `uid`（预览） |
+| `/run/tspi-cam/record.sock` | 0660 | `video` | `uid`、`actionctl` |
+| `/run/tspi-cam/media.sock` | 0660 | `video` | `uid`（预览） |
 
-- `actiond` 启动时先建 `/run/tspi-cam/`（systemd `RuntimeDirectory`），再 bind、`fchown`、`chmod`，
-  最后才 `Hello` 可用。**权限写死在 daemon 里，不靠 umask。**
-- 客户端连不上时错误必须是 `E_IPC` + 路径 + `strerror`，不允许静默重试到超时。
+- `actiond` 启动时建目录（systemd `RuntimeDirectory=tspi-cam`）→ bind → `fchown(0, video_gid)` →
+  `chmod 0660` → 才开始服务。**组权限写死在 daemon 里，不靠 umask。**
+- 客户端连不上必须是 `E_IPC` + 路径 + `strerror`，不允许静默重试到超时。
 
-## 7. 兼容性检查清单（CI 门禁）
+## 8. 门禁（`cargo xtask ipc`）
 
-`cargo xtask ipc` 检查：
+1. **协议示例即测试**：本文所有 ```json 块被抽成夹具，`deserialize→serialize` 必须逐字节等价；
+2. `Call::method()` 与 `#[serde(rename)]` 一一对应，无重复、无孤儿；
+3. 每个 `Call` 变体都有 lane，且与 §3.1 表一致；
+4. 每个 `params` 结构体都有 `deny_unknown_fields`；
+5. 未知方法 → `METHOD_NOT_FOUND`，未知字段 → `INVALID_PARAMS`，各有一个测试；
+6. `API_VERSION` 变更必须同时改 `CHANGELOG` 的 `ipc:` 段。
 
-1. `method` 常量与 `Call::method()` 一一对应，无孤儿方法名；
-2. 每个 `Call` 变体的 `params` 结构体都带 `deny_unknown_fields`；
-3. 每个方法在 lane 表里有且只有一个 lane；
-4. `API_VERSION` 变更必须同时改 `CHANGELOG` 的 `ipc:` 段（缺失则门禁红）。
-
-这四条都是"能被机器判定的契约"，不靠 review。
+每条都要有一次"故意让它红"的记录（负向验证），否则不算门禁。

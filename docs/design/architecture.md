@@ -62,14 +62,17 @@
 
 ```text
 /opt/tspi-cam/releases/<version>/bin/{actiond,uid,actionctl,actioncal}
-/opt/tspi-cam/current -> releases/<version>        # 原子切换
+/opt/tspi-cam/current -> releases/<version>        # 原子切换，restart 生效
 /etc/systemd/system/{actiond,uid}.service
-/etc/sysusers.d/tspi-cam.conf                      # 用户/组：tspi-cam 服务账号、video 组
+/etc/sysusers.d/tspi-cam.conf                      # 服务账号 tspi-cam，加入 video 组
+/etc/udev/rules.d/70-tspi-cam.rules                # /dev/spidev3.0、video4linux、mpp_service、dri
 ```
 
-M1 允许 `deploy/install.sh` 直接铺到 `/usr/local/bin`；一旦需要"回滚到上一版二进制"，
-就切换到 releases 目录 + `current` 符号链接，`systemctl restart` 后生效。**两种布局的配置与
-录制数据路径完全相同**，切换不影响数据。
+**只使用 releases 目录 + `current` 符号链接**，不做"先 `/usr/local/bin` 以后再说"——
+两种布局并存会让"现在跑的是哪一版"变成一个需要猜的问题，而回滚是唯一必须在故障时还能用对的功能。
+`actionctl` 是 `current/bin/actionctl` 的符号链接，升级后立即跟随新版本。
+
+配置与录制数据路径与版本无关：`/etc/tspi-cam`、`/var/lib/tspi-cam`、`/userdata/rec` 不随 releases 移动。
 
 ## 3. 启动顺序与权限
 
@@ -81,10 +84,22 @@ flowchart LR
     ui --> sock
 ```
 
-- `actiond` 以**服务账号**（`DynamicUser` 或 sysusers 建的 `tspi-cam`）运行，加入 `video` 组：
-  `/dev/video*`、`/dev/dri/*`、`/dev/mpp_service`、`/dev/spidev3.0` 都由 udev 规则 `GROUP="video"`
-  开放（当前 `/dev/spidev3.0` 是 `root:root 0600`，必须修）。**不使用 root**——记录设备事实的
-  udev 规则进仓库 `deploy/udev/`。
+- `actiond` 以**服务账号**（sysusers 建的 `tspi-cam`）运行，加入 `video` 组；**不使用 root**。
+  设备访问全部由仓库内 `deploy/udev/70-tspi-cam.rules` 授权（当前 `/dev/spidev3.0` 是 `root:root 0600`，
+  这正是必须补的规则）：
+
+  ```udev
+  # IMU660RB on SPI3
+  KERNEL=="spidev3.0", GROUP="video", MODE="0660"
+  # MPP / 显示 / 相机（板级镜像已有 video 组，这里显式固定，防止镜像改动）
+  KERNEL=="mpp_service", GROUP="video", MODE="0660"
+  SUBSYSTEM=="video4linux", GROUP="video", MODE="0660"
+  KERNEL=="card[0-9]", SUBSYSTEM=="drm", GROUP="video", MODE="0660"
+  KERNEL=="renderD*", SUBSYSTEM=="drm", GROUP="video", MODE="0660"
+  ```
+
+  规则写进仓库、由安装器安装并 `udevadm control --reload && udevadm trigger`；**不靠手工 chmod**
+  （重启即失效，且不可复现）。录制目录 `/userdata/rec` 归 `tspi-cam` 服务账号所有。
 - `uid` 以操作员账号 `k` 运行，通过 socket 组权限访问；它自己需要 `input` 组读触摸（或走 Xorg 的 pointer 事件）。
 - `uid.service` 用 `After=actiond.service` + `Wants=`（不是 `Requires=`）：`actiond` 不在也不阻止 UI 起来报错。
 - `RuntimeDirectory=tspi-cam` 负责 `/run/tspi-cam/` 的创建与清理；**socket 的 `0660` 与组属主写在
