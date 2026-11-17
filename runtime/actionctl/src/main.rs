@@ -1,9 +1,9 @@
-//! `actionctl`: CLI for `actiond` (status / start / stop / show-config).
-//! Talks to the daemon over the control socket only; never touches
-//! hardware. Skeleton: argument parsing only, IPC client lands with the
-//! IPC server (M1 A段 step 8).
+//! `actionctl`: thin client for `actiond`. Builds one typed `Call` per
+//! subcommand; the socket client lands together with the daemon's IPC server,
+//! so today the NDJSON line is printed instead of sent.
 
-use action_ipc::control::ControlRequest;
+use action_ipc::params::{Codec, Resolution, StartParams, StopParams};
+use action_ipc::{Call, Id, Request};
 
 fn usage() -> ! {
     eprintln!("usage: actionctl <status|start|stop|show-config>");
@@ -12,19 +12,26 @@ fn usage() -> ! {
 
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_else(|| usage());
-    let request = match arg.as_str() {
-        "status" | "start" | "stop" => match arg.as_str() {
-            "status" => ControlRequest::GetStatus,
-            "start" => ControlRequest::StartRecording,
-            _ => ControlRequest::StopRecording,
-        },
-        "show-config" => {
-            println!("control socket: /run/tspi-cam/control.sock");
-            return;
-        }
+    let call = match arg.as_str() {
+        "status" => Call::RecordStatus,
+        "start" => Call::RecordStart(StartParams {
+            encode: Resolution {
+                width: 1920,
+                height: 1080,
+            },
+            codec: Codec::H264,
+            bitrate_kbps: 10_000,
+            note: None,
+        }),
+        "stop" => Call::RecordStop(StopParams {
+            reason: "operator".to_string(),
+        }),
+        "show-config" => Call::DeviceConfigGet,
         _ => usage(),
     };
-    // TODO (M1 A段 step 8): send `request` over the control socket and
-    // print the response.
-    println!("(skeleton) would send: {:?}", request);
+    let request = Request::new(Id::Number(1), call);
+    println!(
+        "{}",
+        serde_json::to_string(&request).expect("request is serializable")
+    );
 }

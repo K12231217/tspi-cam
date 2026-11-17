@@ -11,6 +11,7 @@ name = "actionctl"
 path = "src/main.rs"
 
 [dependencies]
+serde_json.workspace = true
 action-ipc.workspace = true
 action-config.workspace = true
 
