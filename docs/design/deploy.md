@@ -3,6 +3,24 @@
 - 状态：v1（2026-11-16）· 拥有者：本文 = 安装布局、systemd 单元与切换、udev、组、回滚检查表
 - 服务划分与"谁拥有什么"见 [architecture.md](architecture.md)；socket 权限表见 [ipc.md](ipc.md) §7。
 
+## 0. 构建环境（2026-11-16 决策）
+
+板端是 **Ubuntu 20.04 / glibc 2.31**，且 MPP 只能通过 `dlopen` 使用——这要求目标二进制
+**动态链接 glibc，且符号版本 ≤2.31**。因此发布构建固定在 Ubuntu 20.04 容器里做，不依赖开发机：
+
+```bash
+deploy/container/build.sh                 # 构建 workspace
+deploy/container/build.sh --example capture_probe
+```
+
+- 镜像：`deploy/container/Dockerfile`（ubuntu:20.04 + rustup + `gcc-aarch64-linux-gnu`）。
+- 为什么不用 musl 静态：静态 musl 不支持 `dlopen`，`librockchip_mpp` 无法加载。
+- 为什么不在开发机直接交叉编译：WSL/24.04 的 glibc 2.39 生成的二进制在板上缺
+  `GLIBC_2.32/2.33/2.34` 符号；用旧 sysroot 手改链接脚本的路线已验证失败（见
+  `docs/research/mpp-encoder-notes.md`）。
+- 开发期权限：板上 `k` 已有 NOPASSWD sudo，`spidev3.0`（`0600 root:root`）等设备直接用
+  `sudo` 访问；`spidev-bind.service`/udev 规则留到发布单元再装，不作为当前 HIL 的前置条件。
+
 ## 1. 安装布局
 
 ```text
