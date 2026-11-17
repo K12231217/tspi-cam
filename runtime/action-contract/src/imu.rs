@@ -1,5 +1,5 @@
 //! IMU660RB: an LSM6DSR-family device on SPI3 (`docs/architecture.md` §6.3,
-//! §16 H3/H6).
+//! §16 H3/H6; board evidence: `docs/research/imu-spi-notes.md`).
 
 /// SPI device node; bound by `spidev-bind.service` at boot (H5), so opening it
 /// can fail before that unit runs.
