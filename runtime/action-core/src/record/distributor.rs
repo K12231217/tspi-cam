@@ -4,7 +4,7 @@
 //! TODO (M1 A段 step 4): bounded video queue (8 frames AND 64 MiB,
 //! first limit wins) + latest-frame preview slot.
 
-use crate::types::Frame;
+use crate::capture::pool::FrameLease;
 
 /// Distributes captured frames to the recorder and to preview.
 pub struct FrameDistributor;
@@ -18,7 +18,7 @@ impl FrameDistributor {
     /// Returns `true` when the frame was accepted into the video queue,
     /// `false` when it was dropped because the queue is full (the caller
     /// counts it in `frames_dropped`).
-    pub fn distribute(&self, _frame: Frame) -> bool {
+    pub fn distribute(&self, _frame: FrameLease) -> bool {
         // TODO: implement in M1 A段 step 4.
         false
     }

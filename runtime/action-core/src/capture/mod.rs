@@ -1,10 +1,14 @@
-//! Camera capture abstraction. Upper layers (distributor, writer,
-//! preview) depend only on [`Frame`] and [`CaptureAdapter`], never on a
-//! concrete V4L2 device. M1 implements the MIPI adapter only; USB was
-//! dropped entirely (architecture v1.2).
+//! Camera capture: one owned `FrameLease` per dequeued buffer, plus the
+//! `FrameSource` trait. The V4L2 binding lands with the board integration; the
+//! pool state machine and its accounting are host-testable here.
 
-use crate::types::{Frame, PixelFormat};
+use std::time::Duration;
+
 use thiserror::Error;
+
+use crate::types::{Geometry, PixelFormat};
+
+pub mod pool;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
@@ -12,16 +16,33 @@ pub enum CaptureError {
     OpenFailed(String, String),
     #[error("capture failed: {0}")]
     ReadFailed(String),
+    #[error("device stopped")]
+    Stopped,
+    #[error("bad stride: stride={stride} vstride={vstride}")]
+    BadStride { stride: u32, vstride: u32 },
+    #[error("invalid pool configuration: {0}")]
+    Invalid(String),
     #[error("unsupported pixel format: {0:?}")]
     UnsupportedFormat(PixelFormat),
 }
 
-/// Low-level camera adapter. One implementation per camera source.
-pub trait CaptureAdapter {
-    fn open(&mut self, device: &str, width: u32, height: u32, fps: u32)
-        -> Result<(), CaptureError>;
-    fn next_frame(&mut self) -> Result<Frame, CaptureError>;
-    fn close(&mut self);
+/// What a started source delivers. `stride`/`vstride` come from the driver's
+/// `plane_fmt` (see `action_contract::nv12`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceInfo {
+    pub geom: Geometry,
+    pub fps: u32,
+    pub stride: u32,
+    pub vstride: u32,
+    pub format: PixelFormat,
 }
 
-pub mod mipi_nv12;
+/// One camera source. `stop()` only stops streaming: leases already handed out
+/// stay readable, and `next_frame` afterwards fails with
+/// [`CaptureError::Stopped`] (not `Ok(None)`).
+pub trait FrameSource: Send {
+    fn start(&mut self, geom: Geometry, fps: u32) -> Result<SourceInfo, CaptureError>;
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<pool::FrameLease>, CaptureError>;
+    fn stop(&mut self);
+    fn info(&self) -> SourceInfo;
+}
