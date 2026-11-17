@@ -1,0 +1,18 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+# Read-only repository tooling (gates, packaging). No workspace deps: it must
+# run even when the crates under test do not compile.
+[dependencies]
+
+[lints]
+workspace = true

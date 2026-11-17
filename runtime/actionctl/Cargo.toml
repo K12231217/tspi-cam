@@ -3,6 +3,8 @@ name = "actionctl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "actionctl"
@@ -11,3 +13,6 @@ path = "src/main.rs"
 [dependencies]
 action-ipc.workspace = true
 action-config.workspace = true
+
+[lints]
+workspace = true

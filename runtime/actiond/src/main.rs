@@ -6,15 +6,24 @@
 //! `/run/tspi-cam/device.lock` before opening any hardware, then parks.
 //! State machine, manager, IPC server and capture loop land in later steps.
 
+#[cfg(unix)]
 use action_config::Config;
-use std::fs::OpenOptions;
-use std::io;
-use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
 use std::path::PathBuf;
 
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+#[cfg(unix)]
 const DEFAULT_CONFIG: &str = "/etc/tspi-cam/actiond.toml";
+#[cfg(unix)]
 const DEVICE_LOCK: &str = "/run/tspi-cam/device.lock";
 
+#[cfg(unix)]
 fn lock_device() -> io::Result<std::fs::File> {
     // Exclusive, non-blocking flock. The kernel releases it if we crash;
     // a leftover lock file means nothing by itself (architecture §11).
@@ -37,6 +46,7 @@ fn lock_device() -> io::Result<std::fs::File> {
 }
 
 /// Minimal `flock(LOCK_EX | LOCK_NB)` without a libc dependency.
+#[cfg(unix)]
 fn libc_flock_ex_nb(fd: i32) -> i32 {
     // LOCK_EX = 2, LOCK_NB = 4. Implemented via the flock syscall through
     // libc symbols linked by std on Linux.
@@ -46,6 +56,7 @@ fn libc_flock_ex_nb(fd: i32) -> i32 {
     unsafe { flock(fd, 2 | 4) }
 }
 
+#[cfg(unix)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = std::env::args()
         .nth(1)
@@ -79,4 +90,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         std::thread::park();
     }
+}
+
+/// Host builds compile the daemon so that `cargo check --workspace` works on a
+/// laptop (interfaces.md §1); it cannot run there because the device lock and
+/// sockets are Linux syscalls.
+#[cfg(not(unix))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    Err("actiond runs on the board only (linux); host builds are for checking".into())
 }

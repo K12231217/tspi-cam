@@ -5,7 +5,11 @@
 
 pub mod capture;
 pub mod clock;
+pub mod encode;
 pub mod imu;
 pub mod orientation;
 pub mod record;
+pub mod scale;
+pub mod session;
+pub mod storage;
 pub mod types;
