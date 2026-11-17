@@ -15,6 +15,7 @@ pub mod encoder;
 pub mod imu;
 pub mod nv12;
 pub mod sensor;
+pub mod v4l2;
 
 #[cfg(test)]
 mod tests;
