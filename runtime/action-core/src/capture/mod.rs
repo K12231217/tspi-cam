@@ -9,6 +9,8 @@ use thiserror::Error;
 use crate::types::{Geometry, PixelFormat};
 
 pub mod pool;
+#[cfg(target_os = "linux")]
+pub mod v4l2;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {

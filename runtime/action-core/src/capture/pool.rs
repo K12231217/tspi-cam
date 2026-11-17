@@ -36,9 +36,31 @@ pub trait Requeue: Send + Sync {
     fn requeue(&self, index: usize) -> Result<(), CaptureError>;
 }
 
+/// Slot payload. Board slots are the driver's mmap regions; host slots are heap
+/// allocations with the same layout so the accounting is testable.
+enum Storage {
+    Heap(Box<[u8]>),
+    /// SAFETY: `ptr`/`len` come from a `VIDIOC_QUERYBUF`+`mmap` pair and stay
+    /// valid until the pool (and therefore every lease) is dropped.
+    Mmap {
+        ptr: *mut u8,
+        len: usize,
+    },
+}
+
+impl Storage {
+    /// SAFETY: caller must hold the slot's lease.
+    unsafe fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Heap(buf) => buf,
+            Self::Mmap { ptr, len } => std::slice::from_raw_parts(*ptr, *len),
+        }
+    }
+}
+
 struct Slot {
     state: AtomicU8,
-    buf: UnsafeCell<Box<[u8]>>,
+    buf: UnsafeCell<Storage>,
 }
 
 struct SeqTracker {
@@ -98,9 +120,44 @@ impl Pool {
         let slots = (0..count)
             .map(|_| Slot {
                 state: AtomicU8::new(FREE),
-                buf: UnsafeCell::new(vec![0u8; frame_bytes].into_boxed_slice()),
+                buf: UnsafeCell::new(Storage::Heap(vec![0u8; frame_bytes].into_boxed_slice())),
             })
             .collect();
+        Self::build(slots, frame_bytes, requeue)
+    }
+
+    /// Board constructor: slots are the driver's mmap regions, indexed exactly
+    /// like `v4l2_buffer.index`.
+    ///
+    /// # Safety
+    ///
+    /// Every `(ptr, len)` must be a live mmap region of this device and must
+    /// stay mapped for the whole lifetime of the pool.
+    pub unsafe fn from_mmaps(
+        regions: Vec<(*mut u8, usize)>,
+        requeue: Box<dyn Requeue>,
+    ) -> Result<Self, CaptureError> {
+        if regions.is_empty() || regions.iter().any(|(_, len)| *len == 0) {
+            return Err(CaptureError::Invalid(
+                "pool needs at least one non-empty mmap region".into(),
+            ));
+        }
+        let frame_bytes = regions.iter().map(|(_, len)| *len).min().unwrap_or(0);
+        let slots = regions
+            .into_iter()
+            .map(|(ptr, len)| Slot {
+                state: AtomicU8::new(FREE),
+                buf: UnsafeCell::new(Storage::Mmap { ptr, len }),
+            })
+            .collect();
+        Self::build(slots, frame_bytes, requeue)
+    }
+
+    fn build(
+        slots: Vec<Slot>,
+        frame_bytes: usize,
+        requeue: Box<dyn Requeue>,
+    ) -> Result<Self, CaptureError> {
         Ok(Self {
             inner: Arc::new(Inner {
                 slots,
@@ -130,19 +187,7 @@ impl Pool {
         stride: u32,
         vstride: u32,
     ) -> Result<Option<FrameLease>, CaptureError> {
-        if self.inner.stopped.load(Ordering::Acquire) {
-            return Err(CaptureError::Stopped);
-        }
-        if stride < geom.w || stride == 0 {
-            return Err(CaptureError::BadStride { stride, vstride });
-        }
-        let luma = nv12::luma_span(stride, vstride);
-        let chroma = nv12::chroma_span(stride, vstride);
-        let total = luma.1 + chroma.1;
-        if total > self.inner.frame_bytes {
-            return Err(CaptureError::BadStride { stride, vstride });
-        }
-
+        self.prepare(geom, stride, vstride)?;
         let mut leased = None;
         for (index, slot) in self.inner.slots.iter().enumerate() {
             if slot
@@ -157,10 +202,65 @@ impl Pool {
         let Some(slot) = leased else {
             return Ok(None);
         };
+        Ok(Some(self.lease(slot, id, pts, geom, stride, vstride)))
+    }
+
+    /// Lease one specific slot. The V4L2 path must do this: the driver returns
+    /// a particular buffer index, and the lease has to wrap that same mmap.
+    pub fn try_lease_slot(
+        &self,
+        index: usize,
+        id: u64,
+        pts: MonoTime,
+        geom: Geometry,
+        stride: u32,
+        vstride: u32,
+    ) -> Result<Option<FrameLease>, CaptureError> {
+        self.prepare(geom, stride, vstride)?;
+        let Some(slot) = self.inner.slots.get(index) else {
+            return Err(CaptureError::Invalid(format!(
+                "buffer index {index} out of range"
+            )));
+        };
+        if slot
+            .state
+            .compare_exchange(FREE, LEASED, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.lease(index, id, pts, geom, stride, vstride)))
+    }
+
+    fn prepare(&self, geom: Geometry, stride: u32, vstride: u32) -> Result<(), CaptureError> {
+        if self.inner.stopped.load(Ordering::Acquire) {
+            return Err(CaptureError::Stopped);
+        }
+        if stride < geom.w || stride == 0 {
+            return Err(CaptureError::BadStride { stride, vstride });
+        }
+        let total = nv12::luma_span(stride, vstride).1 + nv12::chroma_span(stride, vstride).1;
+        if total > self.inner.frame_bytes {
+            return Err(CaptureError::BadStride { stride, vstride });
+        }
+        Ok(())
+    }
+
+    fn lease(
+        &self,
+        slot: usize,
+        id: u64,
+        pts: MonoTime,
+        geom: Geometry,
+        stride: u32,
+        vstride: u32,
+    ) -> FrameLease {
+        let luma = nv12::luma_span(stride, vstride);
+        let chroma = nv12::chroma_span(stride, vstride);
 
         self.record_sequence(id);
         self.inner.dequeued.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(FrameLease {
+        FrameLease {
             id,
             pts,
             geom,
@@ -170,7 +270,7 @@ impl Pool {
             planes: FramePlanes { luma, chroma },
             slot,
             pool: Arc::clone(&self.inner),
-        }))
+        }
     }
 
     pub fn available(&self) -> usize {
@@ -215,7 +315,7 @@ impl Pool {
 impl Inner {
     /// SAFETY: caller must hold the slot's lease (state `LEASED`).
     unsafe fn slot_buf(&self, index: usize) -> &[u8] {
-        (*self.slots[index].buf.get()).as_ref()
+        (*self.slots[index].buf.get()).as_slice()
     }
 
     fn release(&self, index: usize) {
@@ -357,6 +457,27 @@ mod tests {
         assert_eq!(pool.stats().dequeued, 1);
         assert_eq!(pool.stats().returned, 1);
         assert_eq!(pool.stats().return_errors, 0);
+    }
+
+    #[test]
+    fn slot_specific_lease_requeues_that_index() {
+        let (pool, rec) = pool(3);
+        let l = pool
+            .try_lease_slot(2, 9, MonoTime(9), GEOM, 32, 32)
+            .unwrap()
+            .expect("slot 2 is free");
+        assert_eq!(pool.available(), 2);
+        // The driver returned buffer 2; the lease must QBUF that same index.
+        assert!(pool
+            .try_lease_slot(2, 10, MonoTime(10), GEOM, 32, 32)
+            .unwrap()
+            .is_none());
+        drop(l);
+        assert_eq!(rec.calls.lock().unwrap().as_slice(), &[2]);
+        assert!(pool
+            .try_lease_slot(2, 11, MonoTime(11), GEOM, 32, 32)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
