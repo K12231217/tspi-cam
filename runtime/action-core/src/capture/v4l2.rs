@@ -113,6 +113,15 @@ fn qbuf(fd: RawFd, index: u32) -> io::Result<()> {
     check_fd(fd, QBUF, &mut buf as *mut Buffer as *mut libc::c_void)
 }
 
+/// Queue every buffer once, so the driver has the whole pool to write into.
+fn qbuf_all(fd: RawFd, count: u32) -> Result<(), CaptureError> {
+    for index in 0..count {
+        qbuf(fd, index)
+            .map_err(|e| CaptureError::ReadFailed(format!("initial QBUF({index}): {e}")))?;
+    }
+    Ok(())
+}
+
 struct FdHolder(RawFd);
 
 impl Drop for FdHolder {
@@ -135,12 +144,118 @@ impl Requeue for V4l2Requeue {
 
 pub struct V4l2Capture {
     fd: Arc<FdHolder>,
-    /// Declared before `maps`: the pool (and its leases) must be gone before the
-    /// regions are unmapped.
+    /// Owns the mapped regions: the pool unmaps them when its last lease is
+    /// gone, which is the only provably safe point (`pool::Storage`).
     pool: Option<Pool>,
     info: SourceInfo,
-    maps: Vec<(usize, usize)>,
     streaming: bool,
+}
+
+/// `REQBUFS`: ask the driver for `count` mmap buffers, returning how many it
+/// actually granted (it may grant fewer).
+fn reqbufs(fd: RawFd, count: u32) -> Result<u32, CaptureError> {
+    let mut rb = [0u8; 20];
+    rb[0..4].copy_from_slice(&count.to_ne_bytes());
+    rb[4..8].copy_from_slice(&CAPTURE_MPLANE.to_ne_bytes());
+    rb[8..12].copy_from_slice(&MEMORY_MMAP.to_ne_bytes());
+    check_fd(fd, REQBUFS, rb.as_mut_ptr() as *mut libc::c_void)
+        .map_err(|e| CaptureError::ReadFailed(format!("REQBUFS: {e}")))?;
+    let granted = u32::from_ne_bytes([rb[0], rb[1], rb[2], rb[3]]);
+    if granted == 0 {
+        return Err(CaptureError::Invalid("driver allocated no buffers".into()));
+    }
+    Ok(granted)
+}
+
+/// Regions mapped by `start()` but not yet owned by the pool.
+///
+/// `start()` has three fallible steps between the first `mmap` and the pool
+/// taking ownership (`mmap`, initial `QBUF`, `STREAMON`), and each used to need
+/// its own cleanup branch. Staging them here means a leaked mapping needs a
+/// wrong `Drop`, not a forgotten `?`.
+///
+/// `take()` hands ownership to the pool, which unmaps when the last lease is
+/// gone (`pool::Storage::drop`) — the only provably safe point. The driver's
+/// buffers need no explicit release: in mmap mode `close(fd)` frees them, so
+/// there is no `REQBUFS(0)` to sequence against the unmap (`interfaces.md`
+/// §3.1).
+struct StagedMaps(Vec<(*mut u8, usize)>);
+
+impl StagedMaps {
+    fn new(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    /// `QUERYBUF` + `mmap` for one buffer index.
+    fn map(&mut self, fd: RawFd, index: u32) -> Result<(), CaptureError> {
+        let mut plane = Plane {
+            bytesused: 0,
+            length: 0,
+            m: 0,
+            data_offset: 0,
+            reserved: [0; 11],
+        };
+        let mut buf = Buffer {
+            index,
+            type_: CAPTURE_MPLANE,
+            bytesused: 0,
+            flags: 0,
+            field: 0,
+            timestamp_sec: 0,
+            timestamp_usec: 0,
+            timecode: [0; 16],
+            sequence: 0,
+            memory: MEMORY_MMAP,
+            m: &mut plane as *mut Plane as u64,
+            length: 1,
+            reserved2: 0,
+            request_fd: 0,
+        };
+        check_fd(fd, QUERYBUF, &mut buf as *mut Buffer as *mut libc::c_void)
+            .map_err(|e| CaptureError::ReadFailed(format!("QUERYBUF({index}): {e}")))?;
+        let length = plane.length as usize;
+        if length == 0 {
+            return Err(CaptureError::ReadFailed(format!(
+                "QUERYBUF({index}) returned a zero-length plane"
+            )));
+        }
+        let offset = (plane.m & 0xFFFF_FFFF) as i64;
+        // SAFETY: length/offset come from QUERYBUF for this fd.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                offset,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(CaptureError::ReadFailed(format!(
+                "mmap({index}): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        self.0.push((ptr as *mut u8, length));
+        Ok(())
+    }
+
+    /// Hand the mappings to the pool. Ownership transfers at call time,
+    /// **including when `Pool::from_mmaps` rejects them**, so this guard must
+    /// not unmap afterwards.
+    fn take(&mut self) -> Vec<(*mut u8, usize)> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for StagedMaps {
+    fn drop(&mut self) {
+        for (ptr, len) in self.0.drain(..) {
+            // SAFETY: mapped by `map()` and never handed to the pool.
+            unsafe { libc::munmap(ptr as *mut libc::c_void, len) };
+        }
+    }
 }
 
 impl V4l2Capture {
@@ -178,7 +293,6 @@ impl V4l2Capture {
                 vstride: 0,
                 format: PixelFormat::Nv12,
             },
-            maps: Vec::new(),
             streaming: false,
         })
     }
@@ -201,7 +315,7 @@ impl V4l2Capture {
         let stride = u32::from_ne_bytes([fmt[32], fmt[33], fmt[34], fmt[35]]);
         let sizeimage = u32::from_ne_bytes([fmt[28], fmt[29], fmt[30], fmt[31]]);
         let row = stride as u64 * 3 / 2;
-        if stride == 0 || row == 0 || sizeimage as u64 % row != 0 {
+        if stride == 0 || row == 0 || !(sizeimage as u64).is_multiple_of(row) {
             return Err(CaptureError::BadStride { stride, vstride: 0 });
         }
         let vstride = (sizeimage as u64 / row) as u32;
@@ -213,86 +327,20 @@ impl FrameSource for V4l2Capture {
     fn start(&mut self, geom: Geometry, fps: u32) -> Result<SourceInfo, CaptureError> {
         let (stride, vstride) = self.negotiate(geom)?;
 
-        let mut rb = [0u8; 20];
-        rb[0..4].copy_from_slice(&BUFFER_COUNT.to_ne_bytes());
-        rb[4..8].copy_from_slice(&CAPTURE_MPLANE.to_ne_bytes());
-        rb[8..12].copy_from_slice(&MEMORY_MMAP.to_ne_bytes());
-        check_fd(self.fd.0, REQBUFS, rb.as_mut_ptr() as *mut libc::c_void)
-            .map_err(|e| CaptureError::ReadFailed(format!("REQBUFS: {e}")))?;
-        let count = u32::from_ne_bytes([rb[0], rb[1], rb[2], rb[3]]);
-        if count == 0 {
-            return Err(CaptureError::Invalid("driver allocated no buffers".into()));
-        }
+        let count = reqbufs(self.fd.0, BUFFER_COUNT)?;
 
-        let mut maps = Vec::with_capacity(count as usize);
+        let mut maps = StagedMaps::new(count as usize);
         for index in 0..count {
-            let mut plane = Plane {
-                bytesused: 0,
-                length: 0,
-                m: 0,
-                data_offset: 0,
-                reserved: [0; 11],
-            };
-            let mut buf = Buffer {
-                index,
-                type_: CAPTURE_MPLANE,
-                bytesused: 0,
-                flags: 0,
-                field: 0,
-                timestamp_sec: 0,
-                timestamp_usec: 0,
-                timecode: [0; 16],
-                sequence: 0,
-                memory: MEMORY_MMAP,
-                m: &mut plane as *mut Plane as u64,
-                length: 1,
-                reserved2: 0,
-                request_fd: 0,
-            };
-            check_fd(
-                self.fd.0,
-                QUERYBUF,
-                &mut buf as *mut Buffer as *mut libc::c_void,
-            )
-            .map_err(|e| CaptureError::ReadFailed(format!("QUERYBUF({index}): {e}")))?;
-            let length = plane.length as usize;
-            let offset = (plane.m & 0xFFFF_FFFF) as i64;
-            // SAFETY: length/offset come from QUERYBUF for this fd.
-            let ptr = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    length,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    self.fd.0,
-                    offset,
-                )
-            };
-            if ptr == libc::MAP_FAILED {
-                return Err(CaptureError::ReadFailed(format!(
-                    "mmap({index}): {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            maps.push((ptr as usize, length));
+            maps.map(self.fd.0, index)?;
         }
 
         let requeue = Box::new(V4l2Requeue {
             fd: Arc::clone(&self.fd),
         });
-        // SAFETY: the regions were just mapped and live until `maps` is dropped
-        // after the pool (field order guarantees it).
-        let regions = maps
-            .iter()
-            .map(|(ptr, len)| (*ptr as *mut u8, *len))
-            .collect();
-        // SAFETY: regions were mapped above and are unmapped only in `Drop`
-        // after the pool is gone.
-        let pool = unsafe { Pool::from_mmaps(regions, requeue)? };
-        for index in 0..count {
-            qbuf(self.fd.0, index)
-                .map_err(|e| CaptureError::ReadFailed(format!("initial QBUF({index}): {e}")))?;
-        }
+        // SAFETY: the regions came from `mmap` above; ownership moves to the
+        // pool, which unmaps them when the last lease is gone.
+        let pool = unsafe { Pool::from_mmaps(maps.take(), requeue) }?;
+        qbuf_all(self.fd.0, count)?;
         check_fd(
             self.fd.0,
             STREAMON,
@@ -301,7 +349,6 @@ impl FrameSource for V4l2Capture {
         .map_err(|e| CaptureError::ReadFailed(format!("STREAMON: {e}")))?;
 
         self.pool = Some(pool);
-        self.maps = maps;
         self.streaming = true;
         self.info = SourceInfo {
             geom,
@@ -431,13 +478,11 @@ impl FrameSource for V4l2Capture {
 
 impl Drop for V4l2Capture {
     fn drop(&mut self) {
+        // STREAMOFF first: the driver must stop writing into the regions before
+        // the pool can unmap them. Unmapping is the pool's job (`Storage`), and
+        // it happens only when the last lease is gone, so leases handed out
+        // earlier stay readable.
         self.stop();
-        // Drop the pool (leases, QBUF machinery) before unmapping.
-        self.pool = None;
-        for (ptr, len) in self.maps.drain(..) {
-            // SAFETY: mapped by this struct and not used after this point.
-            unsafe { libc::munmap(ptr as *mut libc::c_void, len) };
-        }
     }
 }
 

@@ -7,7 +7,7 @@
 
 #[cfg(target_os = "linux")]
 fn main() {
-    use std::ffi::{c_char, c_void, CString};
+    use std::ffi::{c_void, CString};
 
     const RTLD_NOW: i32 = 2;
     type Ret = i32;

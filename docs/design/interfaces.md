@@ -13,13 +13,17 @@ review 结论：**在第一份可运行实现之前不拆六个 crate**。边界
 |---|---|---|---|
 | `action-ipc` | lib | 线上契约：`Call`/`Event`、方法名、错误码、socket 常量、帧头、**serde 夹具测试** | serde, serde_json, semver |
 | `action-contract` | lib | 器件事实：传感器模式、NV12/stride 公式、编码器上限、IMU 寄存器；**零依赖** | 无 |
-| `action-config` | lib | 配置 schema、默认值、两层合并（`/etc` + `/var/lib`）、校验 | ipc, serde, toml |
-| `action-core` | lib | 采集/编码/IMU/写盘/时钟/存储/缩放，按模块划分：`capture/ encode/ imu/ record/ clock/ storage/ scale/` | ipc, contract, config |
-| `actiond` | bin | 服务：状态机、IPC server、设备锁、事件推送 | core, ipc, config |
+| `action-config` | lib | 配置 schema、默认值、两层合并（`/etc` + `/var/lib`）、校验 | ipc, serde, toml, thiserror |
+| `action-core` | lib | 采集/编码/IMU/写盘/时钟/存储/缩放，按模块划分：`capture/ encode/ imu/ record/ clock/ storage/ scale/` | ipc, contract, serde, thiserror, libc, vqf |
+| `actiond` | bin | 服务：状态机、IPC server、设备锁、事件推送 | core, ipc, config, log, env_logger |
 | `uid` | bin | UI：Xorg/egui、触摸、预览订阅 | ipc |
-| `actionctl` | bin | CLI：所有 `Call` 的薄客户端 | ipc, config |
+| `actionctl` | bin | CLI：所有 `Call` 的薄客户端 | ipc, config, serde_json |
 | `actioncal` | bin | 离线标定：抢锁、采数、写 `calibration.json` | core, contract, config |
 | `xtask` | bin | 门禁与打包 | 无（只读仓库） |
+
+注：`action-core` 的 `libc` 是 `capture/v4l2.rs`、`imu` 的 ioctl 与 `encode/mpp.rs` 的
+`dlopen` 所需，`vqf` 是 `orientation.rs` 的姿态滤波；两者都是实现层依赖，不进 `action-contract`。
+`action-core` **不**依赖 `action-config`：配置在 `actiond` 里合并后以参数传入，core 不读文件。
 
 `action-core` 内部模块边界（禁止互相反向依赖，`xtask arch` 检查 `use`）：
 
@@ -224,7 +228,10 @@ total        = stride*vstride*3/2                  // 实测 sizeimage = 7_558_2
 pub struct EncoderConfig {
     pub codec: Codec,          // H264 | H265
     pub geom: Geometry,        // 编码输出分辨率（白名单见 §5）
+    pub stride: u32,           // 输入帧水平步幅，取自 SourceInfo::stride
+    pub vstride: u32,          // 输入帧垂直步幅，取自 SourceInfo::vstride
     pub bitrate_kbps: u32,
+    pub fps: u32,              // 码控必须知道输入帧率（CBR 的 fps_in/out）
     pub gop: u32,
     pub bframes: u8,           // 契约要求 0
 }
@@ -246,6 +253,10 @@ pub trait VideoEncoder: Send {
 }
 ```
 
+- `stride`/`vstride` 描述**输入**帧，不能从 `geom` 推导：本板 1080p 的驱动行宽是 1920，
+  但 MPP 要求它们与 width/height **在同一个 cfg 里**下发，否则 `MPP_ENC_SET_CFG` 返回
+  `MPP_ERR_VALUE` 而编码器静默停在 1280x720（`feat/encode-blocked` 的全部原因）。
+- `fps` 同理不可省：CBR 需要 `rc:fps_in_num/denorm`，`gop` 也按帧数表达。
 - 编码器**只能**通过 `FrameLease` 取得输入；不接受 `&[u8]`，避免绕过池的裸指针。
 - `submit` 后调用方不得访问该帧；想读就用 `stats()` 或自己复制后再提交（不推荐）。
 - **归还按 `frame_id` 匹配**，不按 FIFO 位置：`bframes=0` 时两者等价，但按 id 才允许编码器在
@@ -253,6 +264,8 @@ pub trait VideoEncoder: Send {
 - 只有 `flush(deadline)` drain 完 EOS 仍有残留输入，才算 `LifecycleMismatch`，计入
   `stats.lifecycle_errors` 并返回 `E_ENC_LIFECYCLE`；此时的录制结果是 `complete=false`，
   不是"静默丢一帧"。
+- `flush` 返回 `()`，所以它 drain 出的 packet **不能丢**：实现必须把它们排队，由后续
+  `poll` 按序吐出。`flush` 之后调用方要一直 `poll` 到 `None` 才算收完。
 
 ## 5. 分辨率契约（sensor / encode / preview 三个几何）
 
