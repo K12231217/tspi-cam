@@ -6,7 +6,7 @@
 fn main() {
     use action_core::capture::{v4l2::V4l2Capture, FrameSource};
     use action_core::encode::mpp::MppEncoder;
-    use action_core::encode::Codec;
+    use action_core::encode::{Codec, EncoderConfig, VideoEncoder};
     use action_core::types::Geometry;
     use std::io::Write;
     use std::time::{Duration, Instant};
@@ -33,20 +33,22 @@ fn main() {
         info.geom.w, info.geom.h, info.stride, info.vstride
     );
 
-    let enc = MppEncoder::open(
-        Codec::H264,
-        info.geom.w,
-        info.geom.h,
-        info.stride,
-        info.vstride,
-        kbps,
+    // Strides come from the driver, not from the requested geometry: that is
+    // the fact that made `feat/encode-blocked` fail (`interfaces.md` §4).
+    let mut enc = MppEncoder::open(&EncoderConfig {
+        codec: Codec::H264,
+        geom: info.geom,
+        stride: info.stride,
+        vstride: info.vstride,
+        bitrate_kbps: kbps,
         fps,
-    )
+        gop: fps * 2,
+        bframes: 0,
+    })
     .unwrap_or_else(|e| {
         eprintln!("encoder open: {e}");
         std::process::exit(1);
     });
-    println!("encoder open: {:?}", enc.codec());
 
     let mut file = std::fs::File::create(&out).unwrap();
     let t0 = Instant::now();
@@ -54,6 +56,15 @@ fn main() {
     let mut packets = 0usize;
     let mut bytes = 0usize;
     let mut keyframes = 0usize;
+
+    let mut write = |p: &action_core::encode::EncodedPacket| {
+        if p.keyframe {
+            keyframes += 1;
+        }
+        bytes += p.data.len();
+        packets += 1;
+        file.write_all(&p.data).unwrap();
+    };
 
     while frames < n {
         let lease = match cam.next_frame(Duration::from_millis(200)) {
@@ -64,41 +75,34 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        match enc.encode(&lease) {
-            Ok(pkts) => {
-                for p in pkts {
-                    if p.keyframe {
-                        keyframes += 1;
-                    }
-                    bytes += p.data.len();
-                    packets += 1;
-                    file.write_all(&p.data).unwrap();
-                }
-            }
-            Err(e) => {
-                eprintln!("encode: {e}");
-                std::process::exit(1);
-            }
+        if let Err(e) = enc.submit(lease) {
+            eprintln!("submit: {e}");
+            std::process::exit(1);
         }
-        drop(lease);
         frames += 1;
-    }
-    match enc.flush() {
-        Ok(pkts) => {
-            for p in pkts {
-                bytes += p.data.len();
-                packets += 1;
-                file.write_all(&p.data).unwrap();
-            }
+        // Drain whatever is ready; the encoder holds the lease until then.
+        while let Ok(Some(p)) = enc.poll(Duration::ZERO) {
+            write(&p);
         }
+    }
+
+    // Drain the tail: `flush` only reports a lifecycle error if inputs are
+    // still held after the deadline; the packets stay readable via `poll`.
+    match enc.flush(Duration::from_secs(2)) {
+        Ok(()) => {}
         Err(e) => eprintln!("flush: {e}"),
     }
+    while let Ok(Some(p)) = enc.poll(Duration::ZERO) {
+        write(&p);
+    }
+
     file.flush().ok();
     cam.stop();
     let elapsed = t0.elapsed().as_secs_f64();
     println!(
-        "done: {frames} frames -> {packets} packets ({keyframes} key) {bytes} B in {elapsed:.3}s = {:.2} fps; cam={:?}",
+        "done: {frames} frames -> {packets} packets ({keyframes} key) {bytes} B in {elapsed:.3}s = {:.2} fps; enc={:?}; cam={:?}",
         frames as f64 / elapsed,
+        enc.stats(),
         cam.stats()
     );
     println!("wrote {out}");

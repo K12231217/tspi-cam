@@ -9,12 +9,21 @@
 //!   With both strides present a single call succeeds (no retry games).
 //! - `encode_get_packet` returns `0` (not EAGAIN) with a NULL packet when the
 //!   queue is empty; that must end the drain, not be dereferenced.
+//!
+//! Input ownership: `submit` takes the lease and keeps it in `pending` until a
+//! packet carrying that frame's token appears, or until the encoder demonstrably
+//! skipped it. That is `interfaces.md` §4's pairing rule, and it is what makes
+//! `in_flight` meaningful: the pool cannot hand the same slot to the driver
+//! while the encoder still believes it owns the frame.
 
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_void, CString};
 use std::ptr;
+use std::time::{Duration, Instant};
 
-use super::EncodedPacket;
+use super::{EncodeError, EncodedPacket, EncoderConfig, EncoderStats, VideoEncoder};
 use crate::capture::FrameLease;
+use crate::types::MonoTime;
 
 pub use super::Codec;
 
@@ -36,6 +45,10 @@ const API_GET_PACKET: usize = 48;
 const API_CONTROL: usize = 112;
 const API_EXPECTED_SIZE: u32 = 8 + 14 * 8 + 16 * 4;
 
+/// How long `poll` sleeps between `get_packet` attempts. MPP has no blocking
+/// wait, so this is the cost of not busy-spinning a core during a 33 ms frame.
+const POLL_SLEEP: Duration = Duration::from_millis(1);
+
 type MppCtx = *mut c_void;
 type MppApi = *mut c_void;
 type MppEncCfg = *mut c_void;
@@ -45,7 +58,7 @@ type MppBuffer = *mut c_void;
 type MppBufferGroup = *mut c_void;
 
 #[derive(Debug, thiserror::Error)]
-pub enum MppError {
+enum MppError {
     #[error("dlopen({0}) failed: {1}")]
     Load(String, String),
     #[error("symbol {0} missing")]
@@ -56,8 +69,12 @@ pub enum MppError {
     Call { call: &'static str, code: i32 },
     #[error("config key {key} rejected with {code}")]
     ConfigKey { key: String, code: i32 },
-    #[error("frame does not hold {expected} bytes")]
-    FrameSize { expected: usize },
+}
+
+impl From<MppError> for EncodeError {
+    fn from(e: MppError) -> Self {
+        Self::Backend(e.to_string())
+    }
 }
 
 struct Lib {
@@ -78,6 +95,16 @@ macro_rules! sym {
         // SAFETY: signature copied from rk_mpi.h / mpp_frame.h.
         unsafe { std::mem::transmute::<Sym, extern "C" fn($($arg),*) -> $ret>(p) }
     }};
+}
+
+/// One submitted frame whose packet has not appeared yet.
+///
+/// The lease is held here on purpose: the pool must not recycle the slot while
+/// the encoder still owns the input (`interfaces.md` §4).
+struct Pending {
+    frame_id: u64,
+    pts: MonoTime,
+    _lease: FrameLease,
 }
 
 pub struct MppEncoder {
@@ -112,19 +139,42 @@ pub struct MppEncoder {
     packet_get_pos: extern "C" fn(MppPacket) -> *mut c_void,
     packet_get_length: extern "C" fn(MppPacket) -> usize,
     packet_get_pts: extern "C" fn(MppPacket) -> i64,
+
+    /// Inputs submitted and not yet released, keyed by the token MPP echoes
+    /// back. Tokens increase with submission order, so a packet whose token is
+    /// `t` proves every pending token `< t` was skipped by the encoder.
+    pending: HashMap<i64, Pending>,
+    next_token: i64,
+    /// Packets drained by `flush`, which returns `()` by contract but must not
+    /// lose them; `poll` serves these first.
+    deferred: VecDeque<EncodedPacket>,
+    stats: EncoderStats,
+    eos_sent: bool,
 }
 
+// SAFETY: every mutating method takes `&mut self`, so the MPP context is only
+// ever driven from one thread at a time. Moving the encoder to another thread
+// transfers that exclusive access; no `&self` method touches the context (only
+// `stats`, which reads plain fields). The raw pointers are owned exclusively by
+// this struct and outlive it only through `Drop`.
+unsafe impl Send for MppEncoder {}
+
 impl MppEncoder {
-    #[allow(clippy::too_many_arguments)]
-    pub fn open(
-        codec: Codec,
-        width: u32,
-        height: u32,
-        stride: u32,
-        vstride: u32,
-        bitrate_kbps: u32,
-        fps: u32,
-    ) -> Result<Self, MppError> {
+    /// Request an IDR on the next submitted frame. Not part of the trait: the
+    /// session decides when a keyframe is wanted (start of recording, recovery
+    /// after an error), the encoder only provides the hook.
+    pub fn request_idr(&mut self) -> Result<(), EncodeError> {
+        // SAFETY: control lives at the documented offset in the table.
+        let control: extern "C" fn(MppCtx, u32, *mut c_void) -> Ret =
+            unsafe { std::mem::transmute(api_slot(self.api, API_CONTROL)) };
+        check(
+            "MPP_ENC_SET_IDR_FRAME",
+            control(self.ctx, MPP_ENC_SET_IDR_FRAME, ptr::null_mut()),
+        )?;
+        Ok(())
+    }
+
+    fn open_inner(cfg: &EncoderConfig) -> Result<Self, MppError> {
         let lib = Lib {
             handle: open_lib()?,
         };
@@ -186,7 +236,7 @@ impl MppEncoder {
                 expected: API_EXPECTED_SIZE,
             });
         }
-        let coding = match codec {
+        let coding = match cfg.codec {
             Codec::H264 => MPP_VIDEO_AVC,
             Codec::H265 => MPP_VIDEO_HEVC,
         };
@@ -196,8 +246,8 @@ impl MppEncoder {
         let control: extern "C" fn(MppCtx, u32, *mut c_void) -> Ret =
             unsafe { std::mem::transmute(api_slot(api, API_CONTROL)) };
 
-        let mut cfg: MppEncCfg = ptr::null_mut();
-        check("mpp_enc_cfg_init", mpp_enc_cfg_init(&mut cfg))?;
+        let mut enc_cfg: MppEncCfg = ptr::null_mut();
+        check("mpp_enc_cfg_init", mpp_enc_cfg_init(&mut enc_cfg))?;
         let set = |cfg: MppEncCfg, key: &str, val: i32| -> Result<(), MppError> {
             let k = CString::new(key).expect("static key");
             let ret = mpp_enc_cfg_set_s32(cfg, k.as_ptr(), val);
@@ -209,14 +259,14 @@ impl MppEncoder {
             }
             Ok(())
         };
-        let bps = bitrate_kbps as i32 * 1000;
+        let bps = cfg.bitrate_kbps as i32 * 1000;
         for (key, value) in [
-            ("prep:width", width as i32),
-            ("prep:height", height as i32),
+            ("prep:width", cfg.geom.w as i32),
+            ("prep:height", cfg.geom.h as i32),
             // Mandatory on this lib: without both strides SET_CFG is rejected
             // with MPP_ERR_VALUE and the encoder silently keeps 1280x720.
-            ("prep:hor_stride", stride as i32),
-            ("prep:ver_stride", vstride as i32),
+            ("prep:hor_stride", cfg.stride as i32),
+            ("prep:ver_stride", cfg.vstride as i32),
             ("prep:format", MPP_FMT_YUV420SP as i32),
             ("codec:type", coding as i32),
             ("rc:mode", MPP_ENC_RC_MODE_CBR),
@@ -224,19 +274,16 @@ impl MppEncoder {
             ("rc:bps_max", bps * 17 / 16),
             ("rc:bps_min", bps * 15 / 16),
             ("rc:fps_in_flex", 0),
-            ("rc:fps_in_num", fps as i32),
+            ("rc:fps_in_num", cfg.fps as i32),
             ("rc:fps_in_denorm", 1),
             ("rc:fps_out_flex", 0),
-            ("rc:fps_out_num", fps as i32),
+            ("rc:fps_out_num", cfg.fps as i32),
             ("rc:fps_out_denorm", 1),
-            ("rc:gop", (fps * 2) as i32),
+            ("rc:gop", cfg.gop as i32),
         ] {
-            set(cfg, key, value)?;
+            set(enc_cfg, key, value)?;
         }
-        check(
-            "MPP_ENC_SET_CFG",
-            control(ctx, MPP_ENC_SET_CFG, cfg as *mut c_void),
-        )?;
+        check("MPP_ENC_SET_CFG", control(ctx, MPP_ENC_SET_CFG, enc_cfg))?;
 
         let mut group: MppBufferGroup = ptr::null_mut();
         let tag = c_str("tspi-cam");
@@ -255,13 +302,13 @@ impl MppEncoder {
         Ok(Self {
             ctx,
             api,
-            cfg,
+            cfg: enc_cfg,
             group,
-            width,
-            height,
-            stride,
-            vstride,
-            codec,
+            width: cfg.geom.w,
+            height: cfg.geom.h,
+            stride: cfg.stride,
+            vstride: cfg.vstride,
+            codec: cfg.codec,
             mpp_destroy,
             enc_cfg_deinit,
             frame_init,
@@ -282,20 +329,20 @@ impl MppEncoder {
             packet_get_pos,
             packet_get_length,
             packet_get_pts,
+            pending: HashMap::new(),
+            next_token: 1,
+            deferred: VecDeque::new(),
+            stats: EncoderStats::default(),
+            eos_sent: false,
         })
     }
 
-    pub fn codec(&self) -> Codec {
-        self.codec
-    }
-
-    /// Encode one NV12 lease; `lease.id` becomes the packet PTS so packets can
-    /// be paired with their source frame (interfaces.md §4).
-    pub fn encode(&self, lease: &FrameLease) -> Result<Vec<EncodedPacket>, MppError> {
+    /// Copy one lease into an MPP buffer and hand it to the encoder.
+    fn put_frame(&mut self, lease: &FrameLease) -> Result<(), EncodeError> {
         let expected = self.stride as usize * self.vstride as usize * 3 / 2;
         let planes = lease.planes();
         if planes[0].len() + planes[1].len() < expected {
-            return Err(MppError::FrameSize { expected });
+            return Err(EncodeError::FrameSize { expected });
         }
         let tag = c_str("tspi-cam");
         let caller = c_str("encode");
@@ -321,6 +368,7 @@ impl MppEncoder {
             );
         }
 
+        let token = self.next_token;
         let mut frame: MppFrame = ptr::null_mut();
         check("mpp_frame_init", (self.frame_init)(&mut frame))?;
         (self.frame_set_width)(frame, self.width);
@@ -328,7 +376,7 @@ impl MppEncoder {
         (self.frame_set_hor_stride)(frame, self.stride);
         (self.frame_set_ver_stride)(frame, self.vstride);
         (self.frame_set_fmt)(frame, MPP_FMT_YUV420SP);
-        (self.frame_set_pts)(frame, lease.id as i64);
+        (self.frame_set_pts)(frame, token);
         (self.frame_set_buffer)(frame, buf);
 
         // SAFETY: put_frame is a table pointer at the documented offset.
@@ -338,11 +386,67 @@ impl MppEncoder {
         (self.frame_deinit)(&mut frame);
         let _ = (self.buffer_put)(buf, caller.as_ptr());
         check("encode_put_frame", ret)?;
-        self.drain_packets()
+
+        // Only advance the token once the frame is really accepted, so a failed
+        // submit never leaves a hole that later looks like a skipped frame.
+        self.next_token += 1;
+        Ok(())
     }
 
-    /// Send an EOS frame and drain whatever the encoder still holds.
-    pub fn flush(&self) -> Result<Vec<EncodedPacket>, MppError> {
+    /// Pull at most one packet. `None` means the encoder has nothing ready.
+    fn drain_one(&mut self) -> Result<Option<EncodedPacket>, EncodeError> {
+        // SAFETY: get_packet is a table pointer at the documented offset.
+        let get: extern "C" fn(MppCtx, *mut MppPacket) -> Ret =
+            unsafe { std::mem::transmute(api_slot(self.api, API_GET_PACKET)) };
+        let mut packet: MppPacket = ptr::null_mut();
+        let ret = get(self.ctx, &mut packet);
+        // This lib signals "empty" with ret == 0 and a null packet.
+        if ret != 0 || packet.is_null() {
+            return Ok(None);
+        }
+        let pos = (self.packet_get_pos)(packet) as *const u8;
+        let len = (self.packet_get_length)(packet);
+        let token = (self.packet_get_pts)(packet);
+        // SAFETY: pos/len describe the packet payload owned by the packet.
+        let data = unsafe { std::slice::from_raw_parts(pos, len) }.to_vec();
+        (self.packet_deinit)(&mut packet);
+        let keyframe = contains_idr(&data, self.codec);
+
+        let Some(p) = self.pending.remove(&token) else {
+            // MPP invented a token: report it rather than attributing the
+            // packet to frame 0 and silently mislabelling a recording.
+            return Err(EncodeError::Backend(format!(
+                "packet with unknown token {token}"
+            )));
+        };
+        // Every still-pending token below this one was skipped by rate control:
+        // release those inputs now, or they would pin the pool forever.
+        self.release_skipped_below(token);
+        self.stats.packets += 1;
+        Ok(Some(EncodedPacket {
+            frame_id: p.frame_id,
+            pts: p.pts,
+            keyframe,
+            data,
+        }))
+    }
+
+    /// Drop every pending input with a token lower than `token`, counting them
+    /// as skipped. Their leases return to the pool here.
+    fn release_skipped_below(&mut self, token: i64) {
+        let skipped: Vec<i64> = self
+            .pending
+            .keys()
+            .copied()
+            .filter(|t| *t < token)
+            .collect();
+        for t in skipped {
+            self.pending.remove(&t);
+            self.stats.skipped += 1;
+        }
+    }
+
+    fn send_eos(&mut self) -> Result<(), EncodeError> {
         let mut frame: MppFrame = ptr::null_mut();
         check("mpp_frame_init", (self.frame_init)(&mut frame))?;
         (self.frame_set_eos)(frame, 1);
@@ -352,46 +456,105 @@ impl MppEncoder {
         let ret = put(self.ctx, frame);
         (self.frame_deinit)(&mut frame);
         check("encode_put_frame(eos)", ret)?;
-        self.drain_packets()
+        Ok(())
     }
+}
 
-    pub fn request_idr(&self) -> Result<(), MppError> {
-        // SAFETY: control lives at the documented offset in the table.
-        let control: extern "C" fn(MppCtx, u32, *mut c_void) -> Ret =
-            unsafe { std::mem::transmute(api_slot(self.api, API_CONTROL)) };
-        check(
-            "MPP_ENC_SET_IDR_FRAME",
-            control(self.ctx, MPP_ENC_SET_IDR_FRAME, ptr::null_mut()),
-        )
-    }
-
-    fn drain_packets(&self) -> Result<Vec<EncodedPacket>, MppError> {
-        // SAFETY: get_packet is a table pointer at the documented offset.
-        let get: extern "C" fn(MppCtx, *mut MppPacket) -> Ret =
-            unsafe { std::mem::transmute(api_slot(self.api, API_GET_PACKET)) };
-        let mut out = Vec::new();
-        loop {
-            let mut packet: MppPacket = ptr::null_mut();
-            let ret = get(self.ctx, &mut packet);
-            // This lib signals "empty" with ret == 0 and a null packet.
-            if ret != 0 || packet.is_null() {
-                break;
-            }
-            let pos = (self.packet_get_pos)(packet) as *const u8;
-            let len = (self.packet_get_length)(packet);
-            let pts = (self.packet_get_pts)(packet);
-
-            // SAFETY: pos/len describe the packet payload owned by the packet.
-            let data = unsafe { std::slice::from_raw_parts(pos, len) }.to_vec();
-            (self.packet_deinit)(&mut packet);
-            let keyframe = contains_idr(&data, self.codec);
-            out.push(EncodedPacket {
-                frame_id: pts.max(0) as u64,
-                keyframe,
-                data,
-            });
+impl VideoEncoder for MppEncoder {
+    fn open(cfg: &EncoderConfig) -> Result<Self, EncodeError> {
+        // Contract: no B-frames, because output order must match input order for
+        // the `frame_id` pairing to work without a reorder buffer.
+        if cfg.bframes != 0 {
+            return Err(EncodeError::Config(format!(
+                "bframes must be 0 (got {})",
+                cfg.bframes
+            )));
         }
-        Ok(out)
+        if cfg.stride < cfg.geom.w || cfg.vstride < cfg.geom.h {
+            return Err(EncodeError::Config(format!(
+                "stride {}x{} smaller than geometry {}x{}",
+                cfg.stride, cfg.vstride, cfg.geom.w, cfg.geom.h
+            )));
+        }
+        Ok(Self::open_inner(cfg)?)
+    }
+
+    fn submit(&mut self, frame: FrameLease) -> Result<(), EncodeError> {
+        if self.eos_sent {
+            return Err(EncodeError::Config("submit after submit_eos".into()));
+        }
+        self.put_frame(&frame)?;
+        let token = self.next_token - 1;
+        self.stats.submits += 1;
+        self.pending.insert(
+            token,
+            Pending {
+                frame_id: frame.id,
+                pts: frame.pts,
+                _lease: frame,
+            },
+        );
+        Ok(())
+    }
+
+    fn poll(&mut self, timeout: Duration) -> Result<Option<EncodedPacket>, EncodeError> {
+        if let Some(p) = self.deferred.pop_front() {
+            return Ok(Some(p));
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(p) = self.drain_one()? {
+                return Ok(Some(p));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(POLL_SLEEP);
+        }
+    }
+
+    fn submit_eos(&mut self) -> Result<(), EncodeError> {
+        if !self.eos_sent {
+            self.send_eos()?;
+            self.eos_sent = true;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, deadline: Duration) -> Result<(), EncodeError> {
+        self.submit_eos()?;
+        let until = Instant::now() + deadline;
+        while !self.pending.is_empty() {
+            match self.drain_one()? {
+                Some(p) => self.deferred.push_back(p),
+                None => {
+                    if Instant::now() >= until {
+                        // Inputs still held after the deadline: this is the
+                        // only condition the contract calls a lifecycle error.
+                        let stuck = self.pending.keys().copied().min().unwrap_or_default();
+                        let frame_id = self
+                            .pending
+                            .get(&stuck)
+                            .map(|p| p.frame_id)
+                            .unwrap_or_default();
+                        let held = self.pending.len() as u64;
+                        self.pending.clear();
+                        self.stats.skipped += held;
+                        self.stats.lifecycle_errors += 1;
+                        return Err(EncodeError::LifecycleMismatch { frame_id });
+                    }
+                    std::thread::sleep(POLL_SLEEP);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn stats(&self) -> EncoderStats {
+        EncoderStats {
+            in_flight: self.pending.len(),
+            ..self.stats
+        }
     }
 }
 

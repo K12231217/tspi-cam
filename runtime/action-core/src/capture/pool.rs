@@ -17,7 +17,8 @@
 //! a heap allocation with the same layout, which makes the accounting testable
 //! without a camera.
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -48,7 +49,32 @@ enum Storage {
     },
 }
 
+impl Drop for Storage {
+    /// The pool owns the mapping, not the caller that `mmap`ed it. This is the
+    /// only point where "no lease can still hold a view" is provable: it runs
+    /// when the last `Arc<Inner>` is gone, which is after every `FrameLease`
+    /// (`interfaces.md` §3.1).
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 impl Storage {
+    /// Give the mapping back to the kernel. Split from `Drop` so the platform
+    /// gate sits on an item rather than on an expression.
+    #[cfg(unix)]
+    fn release(&mut self) {
+        if let Self::Mmap { ptr, len } = self {
+            // SAFETY: the region came from `mmap` and is owned by this pool.
+            unsafe { libc::munmap(*ptr as *mut libc::c_void, *len) };
+        }
+    }
+
+    /// Non-unix hosts never construct `Storage::Mmap` — the V4L2 binding that
+    /// calls `from_mmaps` is Linux-only — so there is nothing to release.
+    #[cfg(not(unix))]
+    fn release(&mut self) {}
+
     /// SAFETY: caller must hold the slot's lease.
     unsafe fn as_slice(&self) -> &[u8] {
         match self {
@@ -83,7 +109,10 @@ struct Inner {
 // SAFETY: `Slot::buf` is only accessed while the slot is `LEASED`, and the
 // `compare_exchange` in `Pool::try_lease` guarantees a single owner. The
 // counters are atomics. `Pool` hands out `&[u8]` tied to `&FrameLease`, so no
-// reference survives the lease.
+// reference survives the lease. Dropping `Inner` runs `Storage::drop`, which
+// `munmap`s mapped regions; that requires the last `Arc<Inner>` and therefore
+// the last `FrameLease` to be gone, so no thread can be reading a region while
+// it is unmapped.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
@@ -131,25 +160,36 @@ impl Pool {
     ///
     /// # Safety
     ///
-    /// Every `(ptr, len)` must be a live mmap region of this device and must
-    /// stay mapped for the whole lifetime of the pool.
+    /// Every `(ptr, len)` must be a live `mmap` region of this device.
+    ///
+    /// Ownership transfers at call time, **including when this returns `Err`**:
+    /// the regions are consumed either into slots (which `munmap` them when the
+    /// last lease is gone) or by the rejection path itself. The caller must
+    /// never unmap them afterwards, and has nothing left to clean up on `Err`.
     pub unsafe fn from_mmaps(
         regions: Vec<(*mut u8, usize)>,
         requeue: Box<dyn Requeue>,
     ) -> Result<Self, CaptureError> {
-        if regions.is_empty() || regions.iter().any(|(_, len)| *len == 0) {
+        if regions.is_empty() {
             return Err(CaptureError::Invalid(
-                "pool needs at least one non-empty mmap region".into(),
+                "pool needs at least one mmap region".into(),
             ));
         }
         let frame_bytes = regions.iter().map(|(_, len)| *len).min().unwrap_or(0);
-        let slots = regions
+        let slots: Vec<Slot> = regions
             .into_iter()
             .map(|(ptr, len)| Slot {
                 state: AtomicU8::new(FREE),
                 buf: UnsafeCell::new(Storage::Mmap { ptr, len }),
             })
             .collect();
+        // Rejecting after the slots exist means their `Drop` unmaps the
+        // regions, so a rejected pool never leaks a mapping.
+        if frame_bytes == 0 {
+            return Err(CaptureError::Invalid(
+                "pool needs at least one non-empty mmap region".into(),
+            ));
+        }
         Self::build(slots, frame_bytes, requeue)
     }
 
@@ -270,6 +310,7 @@ impl Pool {
             planes: FramePlanes { luma, chroma },
             slot,
             pool: Arc::clone(&self.inner),
+            _not_sync: PhantomData,
         }
     }
 
@@ -344,6 +385,12 @@ impl Inner {
 
 /// Owned view of one captured frame. Dropping it returns the buffer to the
 /// driver exactly once.
+///
+/// `Send` but deliberately **not** `Sync` (`interfaces.md` §3): a lease has a
+/// single owner and moves between threads; sharing one by reference would let
+/// two consumers believe they own the same slot, which the pool's CAS cannot
+/// detect. `PhantomData<Cell<()>>` is `Send + !Sync`, so the compiler enforces
+/// what the doc promises.
 pub struct FrameLease {
     /// `v4l2_buffer.sequence`; driver-side gaps are computed from this.
     pub id: u64,
@@ -355,6 +402,8 @@ pub struct FrameLease {
     planes: FramePlanes,
     slot: usize,
     pool: Arc<Inner>,
+    /// Keeps `FrameLease: !Sync` without affecting `Send`.
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 impl FrameLease {
@@ -598,5 +647,30 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<FrameLease>();
         assert_send::<Pool>();
+    }
+
+    #[test]
+    fn lease_is_not_sync() {
+        // Autoref specialization: the inherent method only exists when the type
+        // is `Sync`, so a `Sync` lease would take it and return `true`.
+        struct Probe<T>(std::marker::PhantomData<T>);
+        trait IsSync {
+            fn is_sync() -> bool {
+                false
+            }
+        }
+        impl<T> IsSync for Probe<T> {}
+        // Only reachable when `T: Sync`; the call below resolves to the inherent
+        // method in that case, which is exactly the signal the test reads.
+        #[allow(dead_code)]
+        impl<T: Sync> Probe<T> {
+            fn is_sync() -> bool {
+                true
+            }
+        }
+        assert!(
+            !Probe::<FrameLease>::is_sync(),
+            "FrameLease must stay !Sync (interfaces.md §3)"
+        );
     }
 }
